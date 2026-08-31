@@ -1,0 +1,103 @@
+# 앱 설정 — 비밀이 아닌 값들
+#
+# compose.yaml 의 environment: 가 여기로 온다              (08 문서 대응표)
+#
+# ★ 무엇을 ConfigMap 에 두고 무엇을 Secret 에 둘 것인가
+#
+#   ConfigMap   노출돼도 되는 값
+#               포트, 로그 수준, 타임아웃, 동작 방식
+#
+#   Secret      노출되면 안 되는 값
+#               비밀번호가 들어간 접속 문자열
+#
+#   REDIS_URL 은 비밀번호가 없어서 ConfigMap 에 둔다
+#   DATABASE_URL 은 비밀번호가 들어 있어서 Secret 으로 간다
+#   → 같은 "접속 URL" 인데 나뉘는 이유가 이것이다
+#
+#   앱은 둘 다 그냥 환경변수로 읽는다. 어디서 왔는지 모른다
+#   → 그래서 나누는 판단이 순수하게 "노출돼도 되는가" 로만 결정된다
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bookstore-config
+  namespace: bookstore
+  labels:
+    app.kubernetes.io/part-of: bookstore
+data:
+  # ── 접속 (비밀 없음) ────────────────────────────────
+  #
+  # redis 라는 이름으로 붙는다. Service 이름이다
+  #   같은 네임스페이스면 짧은 이름으로 찾아진다
+  #   정식 이름은 redis.bookstore.svc.cluster.local
+  #
+  # ★ compose 에서는 서비스 이름이 redis 였다. 여기서도 redis 로 맞췄다
+  #   → 앱 코드를 한 줄도 안 고쳐도 된다 (02 문서의 이식성 규칙)
+  REDIS_URL: "redis://redis:6379/0"
+
+  # ── 서버 ────────────────────────────────────────────
+  APP_PORT: "8000"
+  ADMIN_PORT: "9000"
+  LOG_LEVEL: "info"
+
+  # 이미지 태그와 같은 값을 넣는다
+  #   app_info 지표에 실려 나간다 (05 문서)
+  #   → "지금 도는 게 어느 버전인가" 를 지표로 알 수 있다
+  APP_VERSION: "20260826-0301"
+
+  # ── 캐시 ────────────────────────────────────────────
+  CACHE_TTL_SECONDS: "60"
+
+  # ── DB 커넥션 풀 ────────────────────────────────────
+  #
+  # Pod 하나당 최대 10개다. replicas 를 늘리면 곱해진다
+  #   API 3개 + Worker 2개 = 50개
+  #   PostgreSQL 기본 max_connections 는 100이다
+  #   → replicas 를 무작정 늘리면 DB 가 먼저 터진다
+  #   → 6단계에서 실제로 확인할 지점이다
+  DB_POOL_MIN: "2"
+  DB_POOL_MAX: "10"
+  DB_CONNECT_TIMEOUT: "5"
+
+  # ── 재고 차감 방식 ──────────────────────────────────
+  #
+  # none | for_update | conditional      (03 문서)
+  #
+  # ★ 기본은 잠금 없음. 일부러 안전하지 않게 시작한다
+  #   동시 요청으로 재고를 음수로 만든 뒤 잠금을 넣고 비교한다
+  #
+  #   이 값을 ConfigMap 에 둔 이유
+  #     이미지를 다시 안 만들고 방식을 바꿀 수 있다
+  #     → 같은 이미지로 비교해야 실험이 깨끗하다
+  #     → kubectl edit configmap 후 Pod 재시작이면 끝난다
+  STOCK_STRATEGY: "none"
+
+  # ── 큐 / Worker ─────────────────────────────────────
+  QUEUE_NAME: "order_queue"
+  WORKER_POLL_TIMEOUT: "5"
+  # 결제 처리 흉내. 6단계에서 올려 큐를 밀리게 한다
+  WORKER_PROCESS_SECONDS: "1"
+  # 실패 확률. 0.1 로 올리면 보상 트랜잭션이 도는 걸 볼 수 있다
+  WORKER_FAILURE_RATE: "0"
+
+  # ── 종료 ────────────────────────────────────────────
+  #
+  # ★ terminationGracePeriodSeconds 보다 반드시 작아야 한다  (Deployment 참조)
+  #   크면 기다리다가 SIGKILL 을 맞는다 → 정리 절차가 안 돈다
+  #
+  #   SIGTERM → readiness off → 이만큼 대기 → 서버 종료
+  #   그 대기 동안 EndpointSlice 규칙이 전 노드로 퍼진다
+  SHUTDOWN_GRACE_SECONDS: "5"
+
+  # ── 장애 주입 ───────────────────────────────────────
+  #
+  # 로컬에서는 켰다. 여기서도 켠다. 실험이 목적이기 때문이다
+  #
+  # ★ 그런데 이건 프로덕션이면 절대 안 되는 설정이다
+  #   그래서 debug_endpoints_enabled 지표가 1로 뜬다
+  #   → 5단계에서 이 지표에 알람을 건다
+  #   → "실수로 켠 채 배포됐다" 를 잡는 장치다
+  #
+  #   Service 에 관리 포트(9000)를 넣지 않으므로
+  #   클러스터 밖에서는 닿지 않는다 (안전장치 2겹)
+  ENABLE_DEBUG_ENDPOINTS: "true"
+  DEBUG_DEFAULT_TTL_SECONDS: "300"

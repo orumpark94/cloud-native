@@ -1,0 +1,183 @@
+# Redis — Service + Deployment
+#
+# ─────────────────────────────────────────────────────────────
+# 왜 StatefulSet 이 아니라 Deployment 인가                 ★
+#
+#   PostgreSQL 은 StatefulSet 이었다
+#     이름이 고정돼야 하고, 디스크가 따라와야 하고,
+#     같은 데이터에 두 프로세스가 붙으면 안 됐다
+#
+#   Redis 는 그럴 필요가 없다
+#     영속성을 껐다 (--save "" --appendonly no)
+#     디스크에 아무것도 안 쓴다
+#     → 이름이 고정될 이유가 없다
+#     → 볼륨이 없으니 따라올 것도 없다
+#
+#   ★ 대신 대가가 있다
+#     Pod 가 죽으면 캐시도 큐도 통째로 사라진다
+#     → 접수된 주문이 증발한다
+#     → 00 문서에서 "미리 해결하지 않기로 한" 그 모순이다
+#     → 6단계에서 일부러 죽여서 직접 겪는다
+# ─────────────────────────────────────────────────────────────
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: bookstore
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: bookstore
+spec:
+  # 여기는 Headless 가 아니다. 일반 ClusterIP 다
+  #
+  #   postgres 는 Headless 였다
+  #     StatefulSet 이 Pod 이름 DNS 를 만들려면 필요했다
+  #     postgres-0.postgres 로 특정 Pod 를 지목할 수 있어야 했다
+  #
+  #   redis 는 Pod 가 하나뿐이고 지목할 이유가 없다
+  #     → 가상 IP 하나를 받고 iptables 가 뒤로 넘겨준다
+  #     → 2단계에서 본 그 구조다 (존재하지 않는 주소로 통신하기)
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis        # 아래 containerPort 의 이름을 쓴다
+      # ★ 숫자 대신 이름으로 참조하는 이유
+      #   컨테이너 포트를 바꿔도 Service 를 안 고쳐도 된다
+      #   그리고 "6379 가 뭐였더라" 를 안 찾아도 된다
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: bookstore
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: bookstore
+spec:
+  replicas: 1
+  # ★ 늘리면 안 된다
+  #   Redis 인스턴스 두 개는 서로 다른 저장소다
+  #   Service 가 요청을 나눠 보내면
+  #     A 에 캐시한 값을 B 에 물어본다 → 항상 miss
+  #     A 큐에 넣은 주문을 B 에서 꺼내려 한다 → 영원히 안 나온다
+  #   → 진짜로 늘리려면 Redis Cluster 나 Sentinel 이 필요하다
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+    # ★★ selector 는 만든 뒤 수정할 수 없다 (immutable)
+    #   그리고 아래 template.metadata.labels 와 반드시 일치해야 한다
+    #   → 안 맞으면 apply 자체가 거부된다
+    #   → 4단계 결과물 중 "잘못된 Selector 로 인한 장애" 를 여기서 실험한다
+
+  strategy:
+    # ★ 기본값은 RollingUpdate 인데 일부러 Recreate 로 바꾼다
+    #
+    #   [RollingUpdate 면]
+    #     새 Pod 를 띄우고 준비되면 옛 Pod 를 지운다
+    #     → 잠깐 Redis 가 두 개 공존한다
+    #     → Service 가 둘에 나눠 보낸다
+    #     → 캐시가 반반 갈리고, 큐도 갈린다
+    #     → 새 Pod 로 간 주문은 옛 Worker 가 못 본다
+    #
+    #   [Recreate 면]
+    #     옛 Pod 를 완전히 지운 뒤 새 Pod 를 만든다
+    #     → 그 사이 잠깐 다운타임이 생긴다
+    #     → 대신 두 개가 공존하는 일이 없다
+    #
+    #   단일 인스턴스 캐시/큐는 Recreate 가 맞다
+    #   → 앱이 Redis 없이도 조회는 되게 만들어뒀으므로 감당할 수 있다
+    type: Recreate
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/part-of: bookstore
+    spec:
+      terminationGracePeriodSeconds: 15
+
+      containers:
+        - name: redis
+          image: redis:7-alpine
+
+          # ★ 영속성을 명시적으로 끈다                     (00·08 문서)
+          #
+          #   기본값에 맡기지 않는다
+          #   redis 이미지의 기본 설정은 RDB 스냅샷을 남긴다
+          #   → 볼륨이 없으니 컨테이너 안에 쓴다 → 쓰기 가능한 레이어가 커진다
+          #   → 그리고 "영속성이 있는지 없는지" 가 불분명해진다
+          #
+          #   끄기로 한 이유
+          #     캐시로서는 잃어도 된다
+          #     큐로서는 잃으면 안 된다
+          #     그런데 같은 Redis 다  ← 의도적으로 남겨둔 모순
+          #     → 6단계에서 겪은 뒤 판단한다
+          command:
+            - redis-server
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+
+          ports:
+            - name: redis
+              containerPort: 6379
+
+          env:
+            - name: TZ
+              value: UTC
+
+          # ── probe ────────────────────────────────────
+          #
+          # ★★ liveness 를 안 건다                        (04 문서와 같은 판단)
+          #
+          #   Redis 가 응답을 안 하는 흔한 이유
+          #     큰 키를 지우는 중 (DEL 은 O(N) 이다)
+          #     메모리가 꽉 차서 축출 중
+          #     느린 명령(KEYS *)이 이벤트 루프를 잡고 있음
+          #   → 전부 재시작으로 안 풀린다. 잠깐 기다리면 풀린다
+          #
+          #   그리고 여기서는 재시작이 파괴적이다
+          #     영속성이 꺼져 있으므로 재시작 = 큐 전체 소실
+          #     → 접수된 주문이 사라진다
+          #     → "고치려다 데이터를 지우는" 셈이다
+          #
+          #   ★ 그리고 실험이 오염된다
+          #     6단계에서 Redis 를 죽여 큐가 사라지는 걸 관찰할 예정이다
+          #     liveness 가 자동으로 되살리면 그 관찰이 안 된다
+          #
+          #   대신 dependency_up{name="redis"} 지표로 알린다 (05 문서)
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # ── 리소스 ───────────────────────────────────
+          #
+          # ★ 메모리 상한이 특히 중요하다
+          #   Redis 는 메모리를 계속 먹는다. 캐시가 쌓이기 때문이다
+          #   limit 이 없으면 노드 전체 메모리를 먹고
+          #   → 다른 Pod 가 같이 죽는다 (노드 압박)
+          #
+          #   limit 을 걸면 그 Pod 만 OOMKilled 된다
+          #   → 피해 범위가 자기 자신으로 제한된다
+          #
+          #   [주의] Redis 자체의 maxmemory 는 안 걸었다
+          #     안 걸면 limit 에 닿아 OOMKilled 로 죽는다
+          #     걸면 오래된 키를 버리며 버틴다
+          #     → 6단계에서 둘을 비교해볼 지점이다
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi

@@ -1,0 +1,305 @@
+# API — Service + Deployment
+#
+# 이번 파일에 3단계에서 설계한 것이 거의 전부 들어온다
+#   04 문서   probe 에 무엇을 넣고 무엇을 넣지 않는가
+#   05 문서   pod/node 를 Downward API 로 받아 app_info 에 담는다
+#   06 문서   관리 포트를 Service 에 넣지 않는다
+#   07 문서   비-root, 읽기 전용 루트
+#   02 문서   SIGTERM 순서, UTC
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: bookstore
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: bookstore
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+
+  # ★★ 관리 포트(9000)를 여기 넣지 않는다               (06 문서 안전장치 2겹)
+  #
+  #   9000 에는 /metrics, /health/*, /debug/* 가 있다
+  #   특히 /debug/inject/* 는 서비스를 마음대로 망가뜨릴 수 있다
+  #
+  #   Service 에 안 넣으면
+  #     클러스터 안에서도 api:9000 으로 못 간다
+  #     밖에서는 더더욱 못 간다
+  #
+  #   그런데 이 둘은 여전히 동작한다
+  #     kubelet 의 probe    Pod IP 로 직접 부른다 → 정상
+  #     Prometheus 스크레이프  Pod IP 로 직접 긁는다 → 정상
+  #     kubectl port-forward  API Server 를 거쳐 Pod 로 → 정상
+  #
+  #   → "포트를 나눈다" 가 실제 방어가 되는 이유다
+  #     같은 앱에 경로로만 나눴다면 8000 을 여는 순간 같이 열린다
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: bookstore
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: bookstore
+spec:
+  replicas: 2
+  # 2개인 이유
+  #   1개면 롤링 업데이트 중 서비스가 끊긴다
+  #   2개면 하나씩 교체하며 계속 응답할 수 있다
+  #   워커가 2대라 각 노드에 하나씩 가는 게 자연스럽다
+  #   → worker02 에서 이미지가 실제로 쓰이는지도 여기서 확인된다
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable: 0  →  "줄이지 말고 늘려서 교체해라"
+      #   replicas 2 에서 1을 먼저 죽이면 용량이 절반이 된다
+      #   0으로 두면 새 Pod 가 Ready 된 뒤에 옛 Pod 를 지운다
+      #   → 교체 중에도 항상 2개가 서비스한다
+      maxUnavailable: 0
+      # maxSurge: 1  →  한 번에 하나씩만 추가한다
+      #   노드 자원이 빠듯하므로 한꺼번에 늘리지 않는다
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api
+        app.kubernetes.io/part-of: bookstore
+      annotations:
+        # ★ ConfigMap 이 바뀌어도 Pod 는 자동으로 재시작하지 않는다
+        #   환경변수로 주입한 값은 프로세스 시작 시점에 박힌다
+        #   → ConfigMap 을 고쳐도 이미 도는 Pod 에는 반영이 안 된다
+        #   → kubectl rollout restart 를 사람이 해야 한다
+        #
+        #   실무에서는 이 annotation 에 ConfigMap 의 해시를 넣어
+        #   내용이 바뀌면 Pod 스펙이 바뀌게 만든다 (Helm 이 흔히 하는 방식)
+        #   → 지금은 안 한다. 4단계 실험에서 이 불편을 직접 겪는다
+        bookstore/config-note: "ConfigMap 변경 시 kubectl rollout restart 필요"
+
+    spec:
+      # ★ SIGTERM 을 받고 정리할 시간                     (02·04 문서)
+      #
+      #   앱의 SHUTDOWN_GRACE_SECONDS 는 5다
+      #   그보다 반드시 커야 한다
+      #     작으면 → 앱이 기다리는 중에 SIGKILL 을 맞는다
+      #            → 종료 절차가 한 줄도 안 돈다
+      #
+      #   5초(readiness 끄고 대기) + 요청 처리 마무리 + 커넥션 정리
+      #   → 30초면 충분하다
+      terminationGracePeriodSeconds: 30
+
+      securityContext:
+        # ★ 숫자로 지정한다                               (07 문서)
+        #   이름(USER app)으로 쓰면 Kubernetes 가 root 인지 판단 못 한다
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+
+      containers:
+        - name: api
+          # 태그를 바꿀 때마다 이 줄을 고친다
+          #   20260826-0301  최초 배포
+          #   20260826-0839  종료 신호 중복 전달 방어 추가
+          #
+          # ★ 이 한 줄이 GitOps 의 출발점이다
+          #   8단계에서 CI 가 이 줄을 자동으로 커밋하게 만든다
+          image: bookstore:20260826-0839
+
+          # ★ 반드시 IfNotPresent                          (3단계 09 문서)
+          #   레지스트리가 없다. Always 면 받으러 갔다가 실패한다
+          imagePullPolicy: IfNotPresent
+
+          securityContext:
+            # 권한 상승을 막는다 (setuid 바이너리로 root 가 되는 경로 차단)
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # ★ 루트 파일시스템을 읽기 전용으로              (02·07 문서)
+            #   침입해도 바이너리를 심을 수 없다
+            #   앱은 /tmp 외에 아무 데도 안 쓰도록 만들어뒀다
+            #   → 아래 emptyDir 로 /tmp 만 열어준다
+            #
+            #   [실패하면] "Read-only file system" 이 로그에 나온다
+            #   → 어디에 쓰려 했는지가 드러난다. 그것도 배울 점이다
+            readOnlyRootFilesystem: true
+
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: admin
+              containerPort: 9000
+
+          # ★★ preStop — 2026-08-26 추가
+          #
+          # 왜 넣었나
+          #   앱 안에서 SHUTDOWN_GRACE_SECONDS 초를 기다리도록 짜뒀는데
+          #   실제로는 동작하지 않는 것을 실험으로 확인했다
+          #
+          #     08:29:42.088  종료 신호 수신
+          #     08:29:42.088  readiness 를 껐다. grace_seconds: 5.0
+          #     08:29:42.211  종료 신호 재수신. 즉시 종료한다   ← 123ms 뒤
+          #     08:29:42.415  종료 완료
+          #
+          #   SIGTERM 한 번에 신호 처리기가 세 번 불렸다
+          #   → "두 번째 신호는 즉시 종료" 로직이 대기를 건너뛰었다
+          #   → grace 를 0으로 두든 5로 두든 결과가 같았던 이유다
+          #
+          # kubelet 의 Pod 종료 순서
+          #   1. EndpointSlice 에서 뺀다        (병렬로 시작)
+          #   2. preStop 을 실행한다             ← 여기서 시간을 번다
+          #   3. preStop 이 끝나면 SIGTERM 을 보낸다
+          #   4. 앱이 종료한다
+          #
+          # → 앱이 신호를 어떻게 처리하든 kubelet 이 대기를 보장한다
+          # → 앱 코드를 못 고치는 상황(서드파티 이미지)에도 쓸 수 있다
+          #
+          # ★ terminationGracePeriodSeconds 안에 preStop + 앱 종료가 다 들어가야 한다
+          #   preStop 5초 + 앱 종료 1초 << 30초. 여유가 충분하다
+          #   넘으면 preStop 도중에 SIGKILL 을 맞는다
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+
+          # ── 설정 주입 ────────────────────────────────
+          #
+          # envFrom 과 env 를 섞어 쓴다. 이유가 있다
+          envFrom:
+            # ConfigMap 은 통째로 가져온다
+            #   안에 있는 값이 전부 이 앱의 설정이라 골라낼 이유가 없다
+            - configMapRef:
+                name: bookstore-config
+
+          env:
+            # ★ Secret 은 통째로 안 가져온다
+            #   bookstore-secret 에는 POSTGRES_PASSWORD 도 들어 있다
+            #   그건 PostgreSQL 컨테이너용이지 API 가 알 필요가 없다
+            #   → envFrom 으로 통째로 넣으면 API 컨테이너 환경변수에 박힌다
+            #   → 필요한 것만 골라 넣는다 (최소 권한)
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: bookstore-secret
+                  key: DATABASE_URL
+
+            # 이 Pod 가 API 인지 Worker 인지 정한다
+            #   같은 이미지를 두 Deployment 가 쓴다             (07 문서)
+            - name: APP_COMPONENT
+              value: "api"
+
+            # ── Downward API ─────────────────────────
+            #
+            # ★ 자기 자신에 대한 정보를 Kubernetes 에서 받아온다  (05 문서)
+            #
+            #   앱이 자기 Pod 이름을 알 방법이 없다. 뜨기 전에는 정해지지도 않는다
+            #   → Kubernetes 가 환경변수로 넣어준다
+            #
+            #   이 값들은 app_info 지표에만 담는다
+            #   모든 지표에 pod 라벨을 붙이면 시계열이 배로 는다 (카디널리티)
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+            - name: TZ
+              value: UTC
+
+          # ── probe — 04 문서의 판단이 그대로 온다 ──────
+          #
+          # ★ 세 probe 가 전부 관리 포트(9000)를 본다
+          #   서비스 포트가 아니다
+          #   → 서비스가 바빠도 probe 는 따로 응답할 수 있다
+          #   → kubelet 은 Pod IP 로 직접 부르므로 Service 와 무관하다
+
+          # liveness — 프로세스가 살아 있고 응답하는가. 그게 전부다
+          #
+          #   /health/live 는 DB 도 Redis 도 안 본다
+          #   → 의존성을 넣으면 DB 장애 때 모든 Pod 가 재시작한다
+          #   → CrashLoopBackOff → DB 살아나는 순간 커넥션 폭주 → 다시 죽음
+          #   → 재시작이 해결 못 하는 문제에 재시작을 붙이면 나빠진다
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 3
+            # 3번 연속 실패해야 죽인다
+            #   1번이면 일시적 지연에도 재시작한다
+            failureThreshold: 3
+
+          # readiness — 이 Pod 만의 문제만 본다
+          #
+          #   is_ready() 에 들어가는 것
+          #     한 번이라도 DB 에 붙었는가 (초기화 완료)
+          #     종료 절차에 들어갔는가
+          #
+          #   안 들어가는 것
+          #     지금 이 순간 DB 가 살아 있는가     ★
+          #     → DB 는 모든 Pod 가 공유한다
+          #     → 죽으면 전부 Endpoint 에서 빠진다 → 보낼 곳이 없다
+          #     → 캐시로 되던 조회까지 못 하게 된다
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: admin
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+            # 실패하면 즉시 빼고, 성공은 1번으로 다시 넣는다
+            successThreshold: 1
+
+          # startup — 기동에 시간이 걸리는 구간을 감싼다
+          #
+          #   앱이 DB/Redis 연결을 지수 백오프로 재시도한다
+          #   최악 30초쯤 걸릴 수 있다
+          #   → startup 이 통과하기 전에는 liveness 가 시작도 안 한다
+          #   → 기동이 느리다고 죽이는 일을 막는다
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: admin
+            periodSeconds: 3
+            # 3초 × 20 = 60초까지 기다린다
+            failureThreshold: 20
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+          volumeMounts:
+            # readOnlyRootFilesystem 을 켰으므로 쓸 곳을 따로 준다
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+          # emptyDir 은 Pod 와 수명이 같다
+          #   Pod 가 사라지면 내용도 사라진다
+          #   → 임시 파일에는 그게 맞다
+          #   → 로그를 여기 쓰면 안 되는 이유이기도 하다 (stdout 으로 낸다)

@@ -1,0 +1,202 @@
+# 로컬 실행 — 08-compose.md 의 설계
+#
+# ★★ 이 파일의 관점 — Compose 에 의존하지 않는 법
+#
+#   Compose 는 편하다. 그래서 위험하다
+#   "compose up 하면 됩니다" 가 되면 Kubernetes 로 옮길 때 아무것도 못 옮긴다
+#
+#   그래서 여기서 지키는 규칙
+#     1. Compose 만 아는 기능을 쓰지 않는다
+#        (depends_on 의 condition 은 K8s 에 대응물이 없다 — 아래 참조)
+#     2. 설정은 전부 환경변수로 준다. Compose 문법으로 넘기지 않는다
+#     3. 앱은 자기가 Compose 위에 있는지 K8s 위에 있는지 몰라야 한다
+#
+#   → 4단계에서 이 파일의 각 줄이 어떤 K8s 오브젝트가 되는지 대응시킨다
+#
+#
+# Compose ↔ Kubernetes 대응                              (08 문서)
+#
+#   services:          →  Deployment / StatefulSet
+#   environment:       →  ConfigMap + Secret
+#   ports:             →  Service
+#   volumes:           →  PVC (2단계에서 만든 그것)
+#   healthcheck:       →  livenessProbe / readinessProbe
+#   depends_on:        →  대응물이 없다  ★
+#   networks:          →  Service DNS (자동)
+#
+#
+# depends_on 에 대응물이 없다는 게 중요하다              ★★
+#
+#   Compose 는 "db 가 뜬 뒤에 api 를 띄운다" 를 해준다
+#   Kubernetes 는 안 해준다. Pod 기동 순서를 보장하지 않는다
+#
+#   → 그러니 앱이 스스로 견뎌야 한다
+#   → deps.py 의 지수 백오프 재시도가 그것이다
+#
+#   여기서 depends_on 을 쓰긴 하지만 condition 은 안 건다
+#   → DB 가 아직 안 떴을 때 앱이 어떻게 버티는지 로컬에서도 보려는 것이다
+#   → docker compose up 로그에서 "PostgreSQL 연결 재시도" 가 몇 번 뜬다
+#   → 그게 정상이다. 그 재시도가 EKS 에서 우리를 살린다
+
+name: bookstore
+
+services:
+  # ─────────────────────────────────────────────
+  # PostgreSQL
+  # ─────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bookstore
+      POSTGRES_PASSWORD: bookstore_local_only
+      POSTGRES_DB: bookstore
+      # ★ 컨테이너 시간대를 UTC 로 둔다                   (02 문서)
+      #   로컬은 KST, EKS 는 UTC 다
+      #   맞춰두지 않으면 created_at 해석이 환경마다 달라진다
+      TZ: UTC
+    ports:
+      # 호스트에서 psql 로 직접 붙어보려고 연다
+      #   실무에서는 DB 포트를 밖에 열지 않는다
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      # 초기 스키마. 컨테이너가 "처음" 뜰 때만 실행된다     ★
+      #   db-data 볼륨에 데이터가 있으면 실행되지 않는다
+      #   → 스키마를 고쳤는데 반영이 안 되면 볼륨을 지워야 한다
+      #     docker compose down -v
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # pg_isready 는 "연결을 받는가" 만 본다               (04 문서)
+      #   실제 쿼리가 되는지는 확인하지 않는다
+      #   → 그 한계를 알고 쓴다
+      test: ["CMD-SHELL", "pg_isready -U bookstore -d bookstore"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─────────────────────────────────────────────
+  # Redis — 캐시이자 큐다 (00 문서의 의도된 모순)
+  # ─────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    # ★ 영속성을 끈다. 기본값 그대로 두지 않고 명시한다
+    #   캐시로서는 잃어도 된다
+    #   큐로서는 잃으면 주문이 사라진다
+    #   → 같은 Redis 다. 이 모순을 6단계에서 직접 겪는다
+    #   → 겪은 뒤에 --appendonly yes 로 바꾸거나 큐를 DB 로 옮기고 비교한다
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # API
+  # ─────────────────────────────────────────────
+  api:
+    build: .
+    # ★ 태그를 명시한다
+    #   latest 로 두면 "지금 도는 게 어느 코드인지" 를 알 수 없다
+    #   4단계 GitOps 에서 이게 결정적인 문제가 된다
+    image: bookstore:dev
+    depends_on:
+      - db
+      - redis
+    environment:
+      APP_COMPONENT: api
+
+      # ★ URL 을 통째로 준다                              (02 문서)
+      #   host / port / user / password 를 따로 받지 않는다
+      #   → sslmode 하나로 TLS 여부가 정해진다
+      #   → 로컬(평문)과 RDS(TLS)에서 같은 코드가 돈다
+      DATABASE_URL: postgresql://bookstore:bookstore_local_only@db:5432/bookstore
+      REDIS_URL: redis://redis:6379/0
+
+      APP_PORT: "8000"
+      ADMIN_PORT: "9000"
+      LOG_LEVEL: info
+      APP_VERSION: dev
+
+      CACHE_TTL_SECONDS: "60"
+      DB_POOL_MIN: "2"
+      DB_POOL_MAX: "10"
+
+      # ★ 기본은 잠금 없음. 재고가 음수가 되는 걸 먼저 본다  (03 문서)
+      #   나중에 for_update / conditional 로 바꿔가며 비교한다
+      #   이미지를 다시 안 만든다. 환경변수만 바꾼다
+      STOCK_STRATEGY: none
+
+      QUEUE_NAME: order_queue
+      SHUTDOWN_GRACE_SECONDS: "3"
+
+      # 로컬에서만 켠다. 프로덕션 기본값은 false 다        (06 문서 1겹)
+      ENABLE_DEBUG_ENDPOINTS: "true"
+      DEBUG_DEFAULT_TTL_SECONDS: "300"
+
+      # K8s 에서는 Downward API 가 채운다. 여기서는 손으로 넣는다
+      POD_NAME: api-local
+      NODE_NAME: docker-desktop
+      POD_NAMESPACE: local
+      TZ: UTC
+    ports:
+      - "8000:8000"
+      # ★ 관리 포트를 로컬에서는 연다
+      #   K8s 에서는 Service 에 넣지 않는다 (06 문서 2겹)
+      #   → 여기서 여는 건 실험을 위해서다. 그 차이를 기억해야 한다
+      - "9000:9000"
+    healthcheck:
+      # Compose 의 healthcheck 는 K8s 의 probe 와 성격이 다르다   ★
+      #   K8s      실패하면 재시작하거나 Endpoint 에서 뺀다
+      #   Compose  기록만 남는다. 아무 조치도 안 한다
+      #   → 그래도 적어둔다. 4단계에서 이 줄이 probe 가 된다
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:9000/health/live')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+
+  # ─────────────────────────────────────────────
+  # Worker — 같은 이미지, 다른 역할
+  # ─────────────────────────────────────────────
+  worker:
+    image: bookstore:dev
+    # api 가 빌드한 이미지를 그대로 쓴다. build 를 안 적는 이유다
+    depends_on:
+      - api
+    environment:
+      APP_COMPONENT: worker
+
+      DATABASE_URL: postgresql://bookstore:bookstore_local_only@db:5432/bookstore
+      REDIS_URL: redis://redis:6379/0
+
+      # ★ Worker 는 서비스 포트를 안 쓴다
+      #   그래도 APP_PORT 를 준다. config.py 가 둘이 같으면 거부하기 때문이다
+      APP_PORT: "8000"
+      ADMIN_PORT: "9000"
+      LOG_LEVEL: info
+      APP_VERSION: dev
+
+      QUEUE_NAME: order_queue
+      WORKER_POLL_TIMEOUT: "5"
+      # 결제 처리 흉내. 6단계에서 이 값을 올려 큐를 밀리게 한다
+      WORKER_PROCESS_SECONDS: "1"
+      # 실패 확률. 0.1 로 올리면 보상 트랜잭션이 도는 걸 볼 수 있다
+      WORKER_FAILURE_RATE: "0"
+
+      SHUTDOWN_GRACE_SECONDS: "3"
+      ENABLE_DEBUG_ENDPOINTS: "true"
+
+      POD_NAME: worker-local
+      NODE_NAME: docker-desktop
+      POD_NAMESPACE: local
+      TZ: UTC
+    ports:
+      # Worker 의 관리 포트. API 와 겹치면 안 되므로 호스트 쪽만 바꾼다
+      - "9001:9000"
+
+volumes:
+  db-data:

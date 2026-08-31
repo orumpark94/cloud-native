@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: testdeploy
+    labels:
+        app.kubernetes.io/name: testdeploy
+    namespace: bookstore-lab
+spec:
+    replicas: 3
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: testdeploy
+    template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: testdeploy
+        spec:
+          containers:
+            - name: testdeploy
+              image: bookstore:20260826-0839
+              ports:
+                - name: http
+                  containerPort: 8000
+                - name: admin  
+                  containerPort: 9000
+
+              envFrom:
+                - configMapRef: 
+                    name: labconfig
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: labsecret
+                      key: DATABASE_URL
+              volumeMounts:
+                - name: labconfig
+                  mountPath: /etc/labconfig
+                  readOnly: true
+
+                - name: labconfig
+                  mountPath: /etc/loglevel.conf
+                  subPath: LOG_LEVEL
+                  readOnly: true
+
+              livenessProbe:
+                httpGet:
+                  port: admin
+                  path: /health/live
+                periodSeconds: 20
+                timeoutSeconds: 8
+                failureThreshold: 3
+                successThreshold: 1
+
+              startupProbe:
+                httpGet:
+                  port: admin
+                  path: /health/live
+                periodSeconds: 5
+                timeoutSeconds: 3
+                failureThreshold: 20
+                successThreshold: 1
+
+              readinessProbe:
+                httpGet:   
+                  port: admin
+                  path: /health/ready
+                periodSeconds: 10
+                timeoutSeconds: 5
+                failureThreshold: 3
+                successThreshold: 1
+
+              resources:
+                requests:
+                  cpu: 300m
+                  memory: 500Mi
+                limits:
+                  cpu: 500m
+                  memory: 1000Mi
+
+
+                  
+          volumes:
+            - name: labconfig
+              configMap:
+                name: labconfig
+                optional: false

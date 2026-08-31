@@ -1,0 +1,48 @@
+# 빌드 컨텍스트에서 뺄 것
+#
+# .dockerignore 가 왜 중요한가                            ★ 07 문서
+#
+#   [1] 빌드가 느려진다
+#     docker build 는 먼저 컨텍스트 전체를 데몬에 보낸다
+#     .git 이나 .venv 가 있으면 수백 MB 를 매번 전송한다
+#     COPY 를 안 해도 전송은 일어난다
+#
+#   [2] 비밀이 새어나간다                                 ★★
+#     COPY . . 를 쓰면 .env 가 이미지에 들어간다
+#     이미지는 레지스트리에 올라간다. 누가 받아서 열어보면 끝이다
+#     레이어는 append-only 라 나중에 지워도 앞 레이어에 남는다
+#
+#   [3] 캐시가 깨진다
+#     .git/ 은 커밋할 때마다 바뀐다
+#     → COPY . . 레이어가 매번 무효화된다
+#     → 코드를 안 고쳐도 재빌드한다
+#
+# 우리는 COPY ./app 으로 필요한 것만 집는다.
+# 그래도 이 파일을 두는 이유는 [1] 전송 비용 때문이다.
+
+# 비밀
+.env
+.env.*
+*.pem
+*.key
+
+# 버전 관리
+.git
+.gitignore
+
+# 파이썬
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 이미지에 들어갈 이유가 없는 것들
+Dockerfile
+.dockerignore
+compose.yaml
+README.md
+*.md
+sql/

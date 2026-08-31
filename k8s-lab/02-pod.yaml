@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Pod
+metadata:
+    name: testpod
+    labels:
+        app.kubernetes.io/name: testpod
+    namespace: bookstore-lab
+spec:
+    containers:
+        - name: testpod
+          image: bookstore:20260826-0839
+          ports:
+           - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              value: postgresql://bookstore:bookstore_local_only@postgres.bookstore.svc.cluster.local:5432/bookstore
+            - name: REDIS_URL
+              value: redis://redis.bookstore.svc.cluster.local:6379/0

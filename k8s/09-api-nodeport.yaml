@@ -1,0 +1,80 @@
+# 외부 접근 — NodePort
+#
+# ─────────────────────────────────────────────────────────────
+# Service 를 하나 더 만드는가, 기존 것의 type 을 바꾸는가
+#
+#   NodePort 는 ClusterIP 의 상위 집합이다
+#     NodePort Service 도 ClusterIP 를 함께 받는다
+#     → 07-api.yaml 의 type 을 NodePort 로 바꾸기만 해도 됐다
+#
+#   그런데 따로 만든다. 이유가 있다
+#     1. 안과 밖의 경로가 별개의 오브젝트로 보인다
+#        api          클러스터 안에서 쓰는 주소
+#        api-external 밖에서 들어오는 문
+#     2. 외부 노출을 끄고 싶으면 이것만 지우면 된다
+#        내부 통신은 건드리지 않는다
+#     3. 나중에 Ingress 로 갈아탈 때 이것만 걷어내면 된다
+#
+#   실무에서는 보통 하나로 합친다. 여기서는 학습을 위해 나눈다
+#
+#
+# ★★ NodePort 가 실제로 하는 일                          (2단계에서 본 구조)
+#
+#   모든 노드의 30800 포트를 연다. Pod 가 없는 노드도 연다
+#     master01:30800  ← 여기 API Pod 가 없는데도 열린다
+#     worker01:30800
+#     worker02:30800
+#
+#   어느 노드로 들어와도 kube-proxy 가 iptables 규칙으로
+#   실제 Pod 가 있는 곳으로 넘겨준다
+#   → "존재하지 않는 주소로 통신하기" 의 확장판이다
+#
+#   → 그래서 어느 노드 IP 로 붙어도 된다
+#   → 로드밸런서가 없어도 되는 이유이기도 하다
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-external
+  namespace: bookstore
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: bookstore
+spec:
+  type: NodePort
+
+  # selector 는 api Service 와 같다
+  #   두 Service 가 같은 Pod 집합을 가리킨다
+  #   → Service 는 Pod 를 "소유" 하지 않는다. 라벨로 고를 뿐이다
+  #   → 그래서 하나의 Pod 를 여러 Service 가 가리킬 수 있다
+  selector:
+    app.kubernetes.io/name: api
+
+  ports:
+    - name: http
+      port: 8000          # ClusterIP 로도 접근 가능한 포트
+      targetPort: http    # Pod 의 컨테이너 포트 (이름 참조)
+      nodePort: 30800     # ★ 각 노드에서 열리는 포트
+
+      # nodePort 를 명시하는 이유
+      #   생략하면 30000~32767 중에서 자동으로 골라준다
+      #   → 재배포할 때마다 바뀔 수 있다
+      #   → 문서와 스크립트에 적어둔 포트가 안 맞게 된다
+      #   → 6단계 k6 스크립트도 이 포트를 쓴다. 고정해두는 게 낫다
+
+  # ★ 관리 포트(9000)는 여기에도 절대 안 넣는다        (06 문서)
+  #   여기 넣으면 노드 IP 만 알면 밖에서 /debug/inject 를 부를 수 있다
+  #   → 클러스터 밖에서 서비스를 마음대로 망가뜨릴 수 있게 된다
+
+  # externalTrafficPolicy 를 기본값(Cluster)으로 둔다
+  #
+  #   Cluster   어느 노드로 들어오든 아무 Pod 로나 보낸다
+  #             → 다른 노드로 넘어갈 때 SNAT 이 일어난다
+  #             → 앱이 보는 클라이언트 IP 가 노드 IP 로 바뀐다
+  #
+  #   Local     그 노드에 있는 Pod 로만 보낸다
+  #             → 클라이언트 IP 가 보존된다
+  #             → 대신 Pod 없는 노드로 들어오면 그냥 끊긴다
+  #
+  #   지금은 클라이언트 IP 를 쓰지 않으므로 Cluster 로 둔다
+  #   6단계에서 부하 분산이 고르게 되는지 볼 때 다시 볼 지점이다

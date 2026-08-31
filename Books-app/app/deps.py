@@ -30,6 +30,7 @@ import psycopg
 import redis.asyncio as redis_async
 from psycopg_pool import AsyncConnectionPool
 
+from app import metrics
 from app.config import Settings, redact_url
 
 logger = logging.getLogger(__name__)
@@ -94,7 +95,26 @@ class Dependencies:
         self.redis = DependencyState("redis")
 
         self._pool: AsyncConnectionPool | None = None
-        self._redis: redis_async.Redis | None = None
+
+        # ★★ Redis 클라이언트를 둘 둔다                    (2026-08-26 수정)
+        #
+        # 왜 하나로는 안 되는가
+        #   두 경로가 타임아웃에 대해 정반대를 원한다
+        #
+        #   [캐시 경로]   빨리 포기해야 한다
+        #     Redis 가 먹통일 때 오래 기다리면 사용자 요청이 멈춘다
+        #     → 3초 안에 포기하고 DB 로 간다 (00 문서의 경로 1)
+        #
+        #   [큐 대기]     오래 기다리는 게 정상이다
+        #     BRPOP 은 값이 올 때까지 블록한다
+        #     그동안 서버는 아무것도 안 보낸다
+        #     → 소켓이 먼저 끊기면 "정상 대기" 가 "장애" 로 둔갑한다
+        #
+        # 하나로 두고 3초를 쓰면 Worker 가 큐를 영원히 못 읽는다
+        # 하나로 두고 8초를 쓰면 캐시 조회가 8초 멈춘다
+        # → 나눈다
+        self._redis: redis_async.Redis | None = None            # 빠른 명령용
+        self._redis_blocking: redis_async.Redis | None = None   # BRPOP 전용
 
     # ── 기동 ────────────────────────────────────────────
 
@@ -128,7 +148,25 @@ class Dependencies:
             self.settings.redis_url,
             decode_responses=True,          # bytes 가 아니라 str 로 받는다
             socket_connect_timeout=3,
-            socket_timeout=3,
+            socket_timeout=3,               # 빨리 포기한다. 캐시는 없어도 된다
+            health_check_interval=30,
+        )
+
+        # ★ BRPOP 전용. Worker 만 쓴다
+        #
+        #   socket_timeout 은 반드시 BRPOP 의 대기 시간보다 길어야 한다
+        #   같으면 경계에서 간헐적으로 끊긴다 → 재현이 어려운 버그가 된다
+        #   → 여유를 5초 둔다
+        #
+        #   이 관계가 깨지면 무슨 일이 생기는가
+        #     Worker 는 Running, Redis 도 정상, probe 도 통과
+        #     그런데 큐를 한 건도 못 꺼낸다 → 주문이 영원히 pending
+        #     → 2026-08-26 첫 실행에서 실제로 겪은 문제다
+        self._redis_blocking = redis_async.from_url(
+            self.settings.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=3,
+            socket_timeout=self.settings.worker_poll_timeout + 5,
             health_check_interval=30,
         )
 
@@ -205,12 +243,19 @@ class Dependencies:
             except Exception as exc:          # noqa: BLE001
                 logger.warning("커넥션 풀 종료 중 오류", extra={"ctx_error": str(exc)})
 
-        if self._redis is not None:
+        for name, client in (
+            ("Redis", self._redis),
+            ("Redis(blocking)", self._redis_blocking),
+        ):
+            if client is None:
+                continue
             try:
-                await self._redis.aclose()
-                logger.info("Redis 연결 종료")
+                await client.aclose()
+                logger.info(f"{name} 연결 종료")
             except Exception as exc:          # noqa: BLE001
-                logger.warning("Redis 종료 중 오류", extra={"ctx_error": str(exc)})
+                logger.warning(
+                    f"{name} 종료 중 오류", extra={"ctx_error": str(exc)}
+                )
 
     # ── 사용 ────────────────────────────────────────────
 
@@ -222,9 +267,24 @@ class Dependencies:
 
     @property
     def redis_client(self) -> redis_async.Redis:
+        """빠른 명령용. GET / SET / LPUSH / LLEN."""
         if self._redis is None:
             raise RuntimeError("Redis 클라이언트가 아직 없다. startup 을 먼저 불러야 한다")
         return self._redis
+
+    @property
+    def redis_blocking_client(self) -> redis_async.Redis:
+        """블로킹 명령용. BRPOP 만 여기를 쓴다.
+
+        ★ 여기에 GET/SET 을 쓰면 안 된다
+          Redis 가 먹통일 때 poll_timeout+5 초를 기다리게 된다
+          → 그러려고 나눈 게 아니다
+        """
+        if self._redis_blocking is None:
+            raise RuntimeError(
+                "블로킹용 Redis 클라이언트가 아직 없다. startup 을 먼저 불러야 한다"
+            )
+        return self._redis_blocking
 
     # ── 상태 확인 ───────────────────────────────────────
 
@@ -280,13 +340,33 @@ class Dependencies:
 
 
 async def dependency_watcher(deps: Dependencies, interval: float = 10.0) -> None:
-    """주기적으로 의존 서비스 상태를 확인한다. main.py 가 배경으로 돌린다."""
+    """주기적으로 의존 서비스 상태를 확인하고 지표에 반영한다.
+
+    ★★ 지표 갱신을 여기서 하는 이유                        (2026-08-26 수정)
+
+      처음에는 check_postgres() / check_redis() 가
+      DependencyState 만 갱신하고 Prometheus 게이지는 안 건드렸다
+
+      그 결과
+        redis     cache.py 가 요청마다 갱신해줘서 값이 유지됐다
+        postgres  db.py 가 "실패했을 때만" 0 으로 만든다
+                  → 살아나도 1 로 안 돌아온다
+                  → 한 번도 실패한 적 없으면 지표가 아예 없다   ★
+
+      "지표가 아예 없으면 알람이 안 울린다" — 05 문서에 적어둔 함정을
+      코드에서 그대로 밟았다. 첫 실행에서 발견했다
+
+      → 확인하는 곳에서 지표까지 같이 갱신한다
+      → 요청이 하나도 없어도 10초마다 값이 살아 있다
+    """
     while True:
         try:
-            await asyncio.gather(
+            pg_ok, redis_ok = await asyncio.gather(
                 deps.check_postgres(),
                 deps.check_redis(),
             )
+            metrics.set_dependency_up("postgres", pg_ok)
+            metrics.set_dependency_up("redis", redis_ok)
         except asyncio.CancelledError:
             raise
         except Exception as exc:              # noqa: BLE001

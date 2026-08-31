@@ -1,0 +1,255 @@
+# PostgreSQL — Headless Service + StatefulSet
+#
+# Service 와 StatefulSet 을 한 파일에 둔다
+#   StatefulSet 은 serviceName 으로 Service 를 참조한다
+#   둘이 짝이라 떨어뜨리면 한쪽만 적용하는 사고가 난다
+#   → 따로 둘 이유가 없다
+#
+# ─────────────────────────────────────────────────────────────
+# 왜 Deployment 가 아니라 StatefulSet 인가                 ★ 2단계 10편
+#
+#   Deployment    Pod 이름이 무작위다 (api-7d9f8-x2kqp)
+#                 모든 Pod 가 같은 PVC 를 공유하거나 아예 안 쓴다
+#
+#   StatefulSet   Pod 이름이 고정이다 (postgres-0)
+#                 Pod 마다 자기 PVC 를 갖는다 (data-postgres-0)
+#                 Pod 를 지웠다 다시 만들어도 같은 이름 → 같은 PVC → 같은 데이터
+#
+#   "이름이 고정되면 디스크가 따라온다" 가 핵심이다
+#
+# 그리고 "at most one" 보장이 있다
+#   Deployment 는 롤링 업데이트 중 새 Pod 와 옛 Pod 가 잠깐 공존한다
+#   → DB 라면 같은 데이터에 두 프로세스가 붙는다. 파일이 깨진다
+#   → StatefulSet 은 옛 Pod 가 완전히 죽은 뒤 새 Pod 를 만든다
+# ─────────────────────────────────────────────────────────────
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: bookstore
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: bookstore
+spec:
+  # clusterIP: None → Headless Service                    ★ 2단계 10편
+  #
+  #   일반 Service   DNS 가 가상 IP 하나를 준다
+  #                  → iptables 가 뒤에서 Pod 로 분배한다
+  #                  → "어느 Pod 인지" 를 클라이언트가 못 고른다
+  #
+  #   Headless      DNS 가 Pod IP 목록을 직접 준다
+  #                  → postgres-0.postgres 로 특정 Pod 를 지목할 수 있다
+  #                  → 복제 구성에서 "primary 에만 쓴다" 가 가능해진다
+  #
+  #   지금은 Pod 가 하나라 실익이 적지만, StatefulSet 의 표준 구성이다
+  #   그리고 이게 있어야 postgres-0.postgres 이름이 만들어진다
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: bookstore
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: bookstore
+spec:
+  serviceName: postgres      # 위 Headless Service 이름과 정확히 같아야 한다
+  replicas: 1
+  # ★ replicas 를 늘리면 안 된다
+  #   PostgreSQL 은 여러 인스턴스가 같은 데이터를 공유할 수 없다
+  #   복제를 하려면 primary/replica 설정과 승격 로직이 필요하다
+  #   → StatefulSet 이 그걸 대신 해주지 않는다 (2단계 11편)
+  #   → 그래서 Patroni 같은 Operator 가 존재한다
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: bookstore
+    spec:
+      # ★ 볼륨 디렉터리의 소유권을 맞춘다
+      #   local 볼륨은 노드의 디렉터리다. 보통 root 소유로 만들어진다
+      #   postgres 컨테이너는 root 가 아닌 사용자로 돈다
+      #   → 그대로면 "could not create directory: Permission denied" 가 난다
+      #
+      #   fsGroup 을 주면 kubelet 이 마운트할 때 그룹 소유권을 바꿔준다
+      #   → 노드에서 손으로 chown 하지 않아도 된다
+      #
+      #   999 는 데비안 계열 postgres 이미지의 postgres 그룹 GID 다
+      #   alpine 계열은 다를 수 있다. 확인 명령은 04.k8s-manifest 문서에 남긴다
+      securityContext:
+        fsGroup: 999
+
+      # 종료 유예 시간
+      #   PostgreSQL 은 SIGTERM 을 받으면 진행 중인 트랜잭션을 정리하고
+      #   체크포인트를 쓴 뒤 종료한다
+      #   → 짧으면 그 중간에 SIGKILL 을 맞는다 → 다음 기동에서 복구 작업을 한다
+      terminationGracePeriodSeconds: 60
+
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          # ★ 이 이미지는 노드에 없다. Docker Hub 에서 받아온다
+          #   bookstore 이미지와 달리 imagePullPolicy 를 지정하지 않는다
+          #   → 태그가 latest 가 아니므로 기본값이 IfNotPresent 다
+          #   → 노드에 인터넷이 되어야 한다
+
+          ports:
+            - name: postgres
+              containerPort: 5432
+
+          env:
+            - name: POSTGRES_USER
+              value: bookstore
+            - name: POSTGRES_DB
+              value: bookstore
+
+            # 비밀번호는 Secret 에서 가져온다
+            #   valueFrom 을 쓰면 값이 Pod 스펙에 안 박힌다
+            #   → kubectl get pod -o yaml 에 비밀번호가 안 보인다
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: bookstore-secret
+                  key: POSTGRES_PASSWORD
+
+            # ★★ PGDATA 를 하위 디렉터리로 지정한다
+            #
+            #   마운트 지점을 그대로 데이터 디렉터리로 쓰면 문제가 생긴다
+            #     initdb 는 "빈 디렉터리" 를 요구한다
+            #     그런데 마운트 지점에는 lost+found 같은 게 있을 수 있다
+            #     → "directory not empty" 로 기동에 실패한다
+            #
+            #   한 단계 아래를 쓰면 그 문제가 없다
+            #   → 이건 postgres 공식 이미지 문서가 권하는 방식이다
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+
+            # 시간대를 UTC 로 고정한다                     (02 문서)
+            #   TIMESTAMPTZ 를 쓰므로 저장은 안전하지만
+            #   로그 시각이 환경마다 달라지면 대조가 어렵다
+            - name: TZ
+              value: UTC
+
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+
+            # 초기 스키마. ConfigMap 을 파일처럼 마운트한다
+            #   readOnly 를 명시한다 — ConfigMap 볼륨은 어차피 읽기 전용이지만
+            #   의도를 코드에 남긴다
+            - name: init-schema
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+
+          # ── probe ────────────────────────────────────
+          #
+          # ★★ liveness 를 안 건다                        (04 문서, 조사 후 결정)
+          #
+          #   liveness 실패 → 컨테이너 재시작
+          #   그런데 DB 가 응답을 안 하는 이유는 대개 재시작으로 안 풀린다
+          #     긴 쿼리로 바쁨 / 커넥션 포화 / 디스크 문제
+          #   → 재시작하면 진행 중이던 트랜잭션이 날아가고 복구 시간만 는다
+          #
+          #   단일 인스턴스라 재시작하면 서비스가 그동안 통째로 멈춘다
+          #   → 사람이 보고 판단하는 게 낫다
+          #
+          #   HA 구성(Patroni 등)이라면 판단이 달라진다
+          #   죽여도 다른 노드가 승격하므로 자동 재시작이 이득이다
+          #   → 우리는 단일이라 안 건다
+          #
+          # readiness 는 건다
+          #   기동 중에는 Endpoint 에서 빠져 있어야 한다
+          #   → 앱이 준비 안 된 DB 에 붙어 실패하는 걸 줄인다
+          readinessProbe:
+            exec:
+              # pg_isready 는 "연결을 받는가" 만 본다
+              #   실제로 쿼리가 되는지는 확인하지 않는다
+              #   → 그 한계를 알고 쓴다 (04 문서)
+              command:
+                - pg_isready
+                - -U
+                - bookstore
+                - -d
+                - bookstore
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # startup probe 로 초기화 시간을 벌어준다
+          #   첫 기동에는 initdb 와 스키마 적용이 돌아 오래 걸린다
+          #   readiness 만 있으면 그동안 실패가 쌓인다
+          #   → startup 이 통과할 때까지 readiness 는 시작도 안 한다
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "bookstore", "-d", "bookstore"]
+            periodSeconds: 5
+            # 5초 × 30 = 150초까지 기다린다
+            failureThreshold: 30
+
+          # ── 리소스 ───────────────────────────────────
+          #
+          # requests   Scheduler 가 "이만큼 여유 있는 노드" 를 고르는 기준
+          # limits     실제 상한. 넘으면 CPU 는 조여지고 메모리는 OOMKill
+          #
+          # ★ 워커 노드가 2 vCPU / 4GB 다. 넉넉하지 않다
+          #   requests 를 크게 잡으면 Pod 가 아예 스케줄되지 않는다
+          #   → Pending 상태로 남는다
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # CPU limit 을 두는 것에는 논쟁이 있다
+              #   throttling 때문에 오히려 느려질 수 있다
+              #   → 학습 환경이라 다른 Pod 를 굶기지 않게 두었다
+              cpu: 500m
+              memory: 512Mi
+
+      volumes:
+        - name: init-schema
+          configMap:
+            name: postgres-init-schema
+
+  # ── volumeClaimTemplates ────────────────────────────
+  #
+  # ★ Deployment 에는 없는 것이다
+  #   Pod 마다 PVC 를 자동으로 만들어준다
+  #   이름 규칙: <템플릿이름>-<StatefulSet이름>-<순번>
+  #   → data-postgres-0
+  #
+  # ★★ 이 블록은 나중에 수정할 수 없다
+  #   StatefulSet 이 만들어진 뒤에는 immutable 이다
+  #   용량을 바꾸려면 StatefulSet 을 지웠다 다시 만들어야 한다
+  #   (--cascade=orphan 으로 Pod 는 살려둘 수 있다)
+  #
+  # ★★★ StatefulSet 을 지워도 PVC 는 안 지워진다
+  #   데이터를 보호하려는 의도다
+  #   → 실험을 다시 하려면 PVC 를 손으로 지워야 한다
+  #   → "지웠는데 옛날 데이터가 그대로다" 의 원인이 이것이다
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        # PV 와 같게 비워둔다
+        #   생략하면 기본 StorageClass 를 찾는데, 이 클러스터엔 없다
+        #   → PVC 가 Pending 으로 영원히 남는다
+        storageClassName: ""
+        resources:
+          requests:
+            storage: 5Gi

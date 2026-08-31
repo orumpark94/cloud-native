@@ -1,0 +1,204 @@
+# Worker — Deployment 만 있다
+#
+# ★ Service 가 없다
+#   Worker 에게는 아무도 요청을 보내지 않는다
+#   스스로 Redis 큐를 꺼내 갈 뿐이다
+#   → 받을 주소가 필요 없다
+#
+#   그런데 관리 포트(9000)는 연다
+#     kubelet 이 probe 를 부른다        → Pod IP 로 직접
+#     Prometheus 가 지표를 긁는다        → Pod IP 로 직접
+#   → 둘 다 Service 를 안 거친다
+#   → "Service 가 없으면 접근이 불가능하다" 가 아니다
+#
+#
+# API 와 같은 이미지를 쓴다                               (07 문서)
+#   image 줄이 07-api.yaml 과 완전히 같다
+#   APP_COMPONENT 만 다르다
+#
+#   [이미지를 둘로 나눴다면]
+#     API 는 v2 인데 Worker 는 v1 인 상태가 생긴다
+#     두 번 빌드하고 두 번 노드에 밀어넣어야 한다
+#   → 하나로 두면 어긋날 수 없다
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: bookstore
+  labels:
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/part-of: bookstore
+spec:
+  replicas: 1
+  # 1개로 시작한다
+  #
+  # ★ 늘려도 동작하도록 만들어뒀다                        (3단계 조각 7)
+  #   Worker 둘이 같은 주문을 집으면?
+  #     UPDATE orders SET status='processing'
+  #      WHERE id = %s AND status = 'pending'
+  #     → 두 번째는 갱신되는 행이 0개다
+  #     → orders_processed_total{result="duplicate"} 로 센다
+  #
+  #   → Phase 7 에서 replicas 를 늘려 이 방어가 실제로 도는지 확인한다
+  #   → Redis BRPOP 자체도 한 클라이언트에만 값을 준다
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: worker
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # replicas 가 1이라 maxUnavailable: 0 이면
+      # 새 Pod 를 먼저 띄워야 한다 → 잠깐 Worker 가 2개가 된다
+      #
+      # ★ 그래도 괜찮다
+      #   위에 적은 중복 방어가 있고
+      #   BRPOP 은 값을 하나에만 준다
+      #   → 오히려 "교체 중에도 큐가 계속 소비된다" 는 이점이 있다
+      maxUnavailable: 0
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: worker
+        app.kubernetes.io/part-of: bookstore
+
+    spec:
+      # ★ API 보다 넉넉하게 준다
+      #
+      #   Worker 는 SIGTERM 을 받아도 처리 중인 주문을 끝내야 한다
+      #   WORKER_PROCESS_SECONDS 가 1초지만 6단계에서 늘릴 예정이다
+      #
+      #   중간에 SIGKILL 을 맞으면
+      #     주문이 processing 인 채로 남는다
+      #     큐에서는 이미 꺼냈으므로 아무도 다시 안 본다
+      #     → 영원히 processing (worker.py 의 "stuck" 상태)
+      terminationGracePeriodSeconds: 45
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+
+      containers:
+        - name: worker
+          # ★ API 와 완전히 같아야 한다
+          #   두 Deployment 가 같은 이미지를 봐야 버전이 안 어긋난다
+          #   → 한쪽만 고치면 API 는 v2, Worker 는 v1 이 된다
+          image: bookstore:20260826-0839
+          imagePullPolicy: IfNotPresent
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+
+          ports:
+            # 서비스 포트(8000)는 안 연다. HTTP 를 안 받는다
+            #
+            # ★ 그런데 APP_PORT 환경변수는 여전히 준다 (ConfigMap 에 있다)
+            #   config.py 가 APP_PORT 와 ADMIN_PORT 가 같으면 거부하기 때문이다
+            #   → 값은 있지만 Worker 는 쓰지 않는다
+            - name: admin
+              containerPort: 9000
+
+          envFrom:
+            - configMapRef:
+                name: bookstore-config
+
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: bookstore-secret
+                  key: DATABASE_URL
+
+            # ★ 여기 한 글자가 API 와의 유일한 차이다
+            - name: APP_COMPONENT
+              value: "worker"
+
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+            - name: TZ
+              value: UTC
+
+          # ── probe ────────────────────────────────────
+          #
+          # ★ Worker 에 probe 를 다는 게 이상해 보일 수 있다
+          #   Service 뒤에 있지도 않은데 readiness 가 무슨 의미인가?
+          #
+          #   [liveness]  의미가 있다
+          #     프로세스가 멈추면 재시작해야 한다
+          #     Worker 는 멈춰도 아무도 모른다. 큐만 조용히 쌓인다
+          #     → 이벤트 루프가 막히면 /health/live 도 응답을 못 한다
+          #     → 그 상황은 재시작이 실제로 해결한다
+          #
+          #   [readiness] 트래픽과는 무관하지만 배포에 쓰인다
+          #     Deployment 는 새 Pod 가 Ready 가 돼야 롤아웃을 끝낸다
+          #     → 안 달면 "떴다" 만 보고 옛 Pod 를 지운다
+          #     → 새 Worker 가 DB 연결에 실패했어도 롤아웃이 성공으로 보인다
+          #
+          # ★★ 그런데 이것만으로는 부족하다
+          #   프로세스는 멀쩡한데 큐를 안 보는 상태가 있을 수 있다
+          #   → 3단계 첫 실행에서 실제로 겪었다 (Redis 소켓 타임아웃)
+          #   → probe 는 전부 통과했고 주문만 안 처리됐다
+          #
+          #   그건 probe 로 못 잡는다. 지표로 잡는다
+          #     time() - worker_last_poll_timestamp_seconds > 60
+          #   → 5단계에서 이 알람을 만든다
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: admin
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: admin
+            periodSeconds: 3
+            failureThreshold: 20
+
+          # API 보다 CPU 를 조금 더 준다
+          #   결제 처리 흉내가 CPU 를 쓰지는 않지만(sleep 이다)
+          #   6단계에서 처리 로직을 무겁게 만들 예정이다
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}

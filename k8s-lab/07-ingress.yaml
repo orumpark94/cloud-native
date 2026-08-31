@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: labingress
+  namespace: bookstore-lab
+
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /books
+            pathType: Prefix 
+            backend:
+              service:
+                name: servicetest
+                port:
+                  number: 80
+
+                

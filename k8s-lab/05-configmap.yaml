@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: labconfig
+  namespace: bookstore-lab
+  labels:
+    app.k8s: bookstore-lab-configmap
+
+data:
+  REDIS_URL: redis://redis.bookstore.svc.cluster.local:6379/0
+  LOG_LEVEL: debug
+  CACHE_TTL_SECONDS: "30"
+  APP_VERSION: lab-001
+  ENABLE_DEBUG_ENDPOINTS: "true"
+

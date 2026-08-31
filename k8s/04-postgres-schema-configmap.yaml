@@ -1,0 +1,124 @@
+# 초기 스키마
+#
+# compose 에서는 ./sql 을 볼륨으로 마운트했다
+# k8s 에는 "호스트의 디렉터리" 라는 개념을 쓰면 안 된다 (노드마다 다르니까)
+# → ConfigMap 을 볼륨으로 마운트한다
+#
+#
+# ★★ ConfigMap 볼륨은 파일처럼 보이지만 파일이 아니다     (2단계에서 확인한 것)
+#
+#   컨테이너 안에서 /docker-entrypoint-initdb.d/01_schema.sql 로 보인다
+#   그런데 실제로는 심볼릭 링크의 연쇄다
+#
+#     01_schema.sql -> ..data/01_schema.sql
+#     ..data        -> ..2026_08_26_.../
+#
+#   왜 이렇게 만드는가
+#     ConfigMap 이 바뀌면 kubelet 이 새 디렉터리를 만들고
+#     ..data 심볼릭 링크를 원자적으로 바꿔치기한다
+#     → 파일이 반쯤 쓰인 상태를 앱이 보는 일이 없다
+#
+#   대가
+#     읽기 전용이다. 컨테이너가 못 고친다
+#     그리고 갱신에 최대 1분쯤 걸린다 (kubelet 동기화 주기)
+#
+#
+# ★ 이 SQL 은 Books-app/sql/01_schema.sql 과 같아야 한다
+#   지금은 두 곳에 복사본이 있는 중복 상태다
+#   → 4단계 후반에 "스키마 변경을 어떻게 배포하는가" 를 다루며
+#      Job 으로 옮기고 이 중복을 없앤다
+#   → 그때까지는 한쪽을 고치면 다른 쪽도 고쳐야 한다
+#
+#
+# 언제 실행되는가
+#   postgres 이미지는 /docker-entrypoint-initdb.d/*.sql 을
+#   "데이터 디렉터리가 비어 있을 때만" 실행한다
+#   → 두 번째 기동부터는 실행되지 않는다
+#   → 스키마를 고쳐도 반영되지 않는다는 뜻이다  ★ 자주 겪는 함정
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-schema
+  namespace: bookstore
+  labels:
+    app.kubernetes.io/part-of: bookstore
+data:
+  01_schema.sql: |
+    -- 서점 APP 스키마 (원본: Books-app/sql/01_schema.sql)
+    --
+    -- 여기서 "안 만든 것" 이 만든 것만큼 중요하다
+    --   재고 음수 방지 CHECK   안 건다 → 음수가 되는 걸 관찰한 뒤에 건다
+    --   인덱스                 안 만든다 → 느려지는 걸 측정한 뒤에 만든다
+
+    CREATE TABLE IF NOT EXISTS books (
+        id     BIGSERIAL PRIMARY KEY,
+        title  TEXT      NOT NULL,
+        -- 금액은 INTEGER, 원 단위다. 부동소수점으로 돈을 다루지 않는다
+        price  INTEGER   NOT NULL,
+        -- 재고를 books 에 둔다. hot row 병목을 알면서 고른 것이다
+        stock  INTEGER   NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS orders (
+        id              BIGSERIAL   PRIMARY KEY,
+        user_id         BIGINT      NOT NULL,
+        book_id         BIGINT      NOT NULL REFERENCES books(id),
+        quantity        INTEGER     NOT NULL,
+        -- 주문 시점의 가격을 박아둔다. 책값이 바뀌어도 과거 주문은 그대로여야 한다
+        unit_price      INTEGER     NOT NULL,
+        status          TEXT        NOT NULL DEFAULT 'pending',
+
+        -- 시각을 셋으로 나눈다
+        --   created → started   큐에서 기다린 시간
+        --   started → finished  실제 처리 시간
+        --   하나로 뭉치면 "5초 걸렸다" 만 알고 왜 느린지 모른다
+        --
+        -- 전부 TIMESTAMPTZ 다. 로컬은 KST, EKS 는 UTC 라 해석이 흔들리면 안 된다
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+        started_at      TIMESTAMPTZ,
+        finished_at     TIMESTAMPTZ,
+        failure_reason  TEXT,
+
+        CONSTRAINT orders_status_valid
+            CHECK (status IN ('pending','processing','completed','failed')),
+        CONSTRAINT orders_quantity_positive
+            CHECK (quantity > 0)
+    );
+
+    -- 상태 전이를 DB 로 강제하지 않는다
+    --   completed 인 주문이 다시 processing 이 되는 것을 막지 않았다
+    --   → 그런 일이 실제로 일어나는지 관찰하려는 것이다
+    --   앱에서 UPDATE ... WHERE status='pending' 으로 막는다
+
+    -- 초기 데이터 — 책 1,000권
+    --
+    -- 재고를 일부러 불균등하게 준다
+    --   전부 100권이면 품절이나 동시성 문제를 만들기 어렵다
+    --   id % 97 = 0  → 1권   동시 주문으로 음수를 만들기 쉽다
+    --   id % 7  = 0  → 5권   품절(409)을 관찰한다
+    INSERT INTO books (title, price, stock)
+    SELECT
+        '테스트 도서 ' || i,
+        8000 + (i % 40) * 500,
+        CASE
+            WHEN i % 97 = 0 THEN 1
+            WHEN i % 7  = 0 THEN 5
+            ELSE 100
+        END
+    FROM generate_series(1, 1000) AS i
+    WHERE NOT EXISTS (SELECT 1 FROM books);
+
+    -- 나중에 추가할 것들 — 지금은 실행하지 않는다
+    --
+    -- [1] 재고 음수 방지 — 음수를 실제로 관찰한 뒤에 건다
+    --     지금 걸면 STOCK_STRATEGY=none 실험이 불가능하다
+    -- ALTER TABLE books ADD CONSTRAINT books_stock_non_negative CHECK (stock >= 0);
+    --
+    -- [2] 인덱스 — 느린 것을 측정한 뒤에 만든다
+    -- CREATE INDEX idx_orders_user_created   ON orders (user_id, created_at DESC);
+    -- CREATE INDEX idx_orders_status_created ON orders (status, created_at);
+    -- CREATE INDEX idx_orders_book           ON orders (book_id);
+    --
+    -- [3] 갇힌 주문 찾기 — 5단계 정합성 검증 Job 이 쓸 쿼리
+    -- SELECT id, started_at FROM orders
+    --  WHERE status = 'processing' AND started_at < now() - INTERVAL '5 minutes';

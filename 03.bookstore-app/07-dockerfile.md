@@ -1,5 +1,16 @@
 # 07. Dockerfile — 이미지를 만든다
 
+> **2026-08-26 정정** — 이 문서의 예시 Dockerfile 두 줄이 실제로는 동작하지 않았다.
+> 구현하며 바로잡았고, 최종 파일은 `Books-app/Dockerfile` 이다.
+>
+> | 이 문서 | 실제 | 이유 |
+> |---|---|---|
+> | `WORKDIR /app` + `COPY ./app /app` | `WORKDIR /srv` + `COPY ./app /srv/app` | `/app` 에 코드를 두고 WORKDIR 도 `/app` 이면 python 이 `app` 패키지를 못 찾는다. `import app.main` 이 되려면 `app/` 의 **부모** 가 작업 경로여야 한다 |
+> | `CMD ["python","-m","uvicorn","app.main:app",...]` | `CMD ["python","-m","app.main"]` | 포트가 둘(8000/9000)이라 uvicorn 명령 하나로는 하나만 뜬다. SIGTERM 순서도 직접 통제해야 해서 `main.py` 가 서버를 띄운다 |
+>
+> 아래 본문의 나머지 판단(멀티스테이지, exec 형식, 비-root UID, 레이어 순서)은 그대로 유효하다.
+> 자세한 경위는 [09-implementation.md](09-implementation.md) 3절 참조.
+
 앞 문서들에서 넘어온 제약을 여기서 전부 반영한다.
 
 ```text

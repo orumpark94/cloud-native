@@ -105,6 +105,16 @@ class Settings:
     database_url: str
     redis_url: str
 
+    # ── 이 프로세스가 무엇인가 ──────────────────────────
+    # api | worker
+    #
+    # 왜 같은 이미지에서 갈라 쓰는가                        ★ 07 문서
+    #   이미지를 둘로 나누면 버전이 어긋난다
+    #   API 는 v2 인데 Worker 는 v1 인 상태가 생긴다
+    #   → 같은 이미지를 환경변수로 갈라 쓴다
+    #   → Deployment 두 개가 같은 image 태그를 본다
+    component: str
+
     # ── 서버 ────────────────────────────────────────────
     app_port: int          # 서비스 포트. Service 와 Ingress 가 연결된다
     admin_port: int        # 관리 포트. /metrics, /health/*, /debug/*  (Service 에 안 넣는다)
@@ -118,6 +128,19 @@ class Settings:
     db_pool_min: int
     db_pool_max: int
     db_connect_timeout: float
+
+    # ── 재고 차감 방식 ──────────────────────────────────
+    # 03 문서의 "주문 SQL 을 세 번에 걸쳐 발전시킨다" 를 환경변수로 바꾼다
+    #
+    #   none         잠금 없이. 동시 주문에서 재고가 음수가 된다     ← 기본값
+    #   for_update   SELECT ... FOR UPDATE. 안전하지만 직렬화된다
+    #   conditional  UPDATE ... WHERE stock >= n. 잠금 구간이 짧다
+    #
+    # 왜 환경변수로 두는가
+    #   6단계에서 세 방식의 처리량을 비교해야 한다
+    #   → 코드를 고쳐 재빌드하면 "같은 이미지" 비교가 아니게 된다 (02 문서)
+    #   → 환경변수만 바꿔 같은 이미지로 비교한다
+    stock_strategy: str
 
     # ── 큐 / Worker ─────────────────────────────────────
     queue_name: str
@@ -152,6 +175,8 @@ def load_settings() -> Settings:
         # 필수
         database_url=loader.required("DATABASE_URL"),
         redis_url=loader.required("REDIS_URL"),
+        # 이 프로세스의 역할
+        component=loader.string("APP_COMPONENT", "api").lower(),
         # 서버
         app_port=loader.integer("APP_PORT", 8000, minimum=1),
         admin_port=loader.integer("ADMIN_PORT", 9000, minimum=1),
@@ -162,6 +187,8 @@ def load_settings() -> Settings:
         db_pool_min=loader.integer("DB_POOL_MIN", 2, minimum=0),
         db_pool_max=loader.integer("DB_POOL_MAX", 10, minimum=1),
         db_connect_timeout=loader.number("DB_CONNECT_TIMEOUT", 5.0, minimum=0.1),
+        # 재고 차감 방식
+        stock_strategy=loader.string("STOCK_STRATEGY", "none").lower(),
         # 큐 / Worker
         queue_name=loader.string("QUEUE_NAME", "order_queue"),
         worker_poll_timeout=loader.number("WORKER_POLL_TIMEOUT", 5.0, minimum=0.1),
@@ -192,6 +219,15 @@ def load_settings() -> Settings:
         loader.errors.append(
             f"APP_PORT 와 ADMIN_PORT 가 같다({settings.app_port}). "
             "관리 포트는 따로 열어야 한다 (04·06 문서)"
+        )
+    if settings.component not in ("api", "worker"):
+        loader.errors.append(
+            f"APP_COMPONENT='{settings.component}' 는 알 수 없는 값이다 (api|worker)"
+        )
+    if settings.stock_strategy not in ("none", "for_update", "conditional"):
+        loader.errors.append(
+            f"STOCK_STRATEGY='{settings.stock_strategy}' 는 알 수 없는 값이다 "
+            "(none|for_update|conditional)"
         )
 
     if loader.errors:
