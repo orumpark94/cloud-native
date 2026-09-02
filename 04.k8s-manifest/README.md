@@ -72,6 +72,7 @@ master01 에 NoSchedule    → 앱 Pod 가 control-plane 에 안 뜬다
 | [00-image-check.md](00-image-check.md) | 매니페스트를 쓰기 전에 이미지부터 검증 |
 | [01-manifests.md](01-manifests.md) | 매니페스트 10개 구성과 판단 |
 | [02-experiments.md](02-experiments.md) | 실험 D(PVC) / A(롤링 업데이트) / B(ConfigMap) |
+| [03-dynamic-provisioning.md](03-dynamic-provisioning.md) | StorageClass 도입. 정적 → 동적 프로비저닝 |
 
 매니페스트 실물은 [`k8s/`](../k8s/), 실습용은 `k8s-lab/` 에 있다.
 
@@ -89,11 +90,19 @@ master01 에 NoSchedule    → 앱 Pod 가 control-plane 에 안 뜬다
 | 4 | 지워도 다시 생깁니다. 그런데 배포하니 1%가 실패했습니다 | 개념 + 직접 쓰기 + 롤링 업데이트 실험 | 원고 |
 | 5 | Endpoints 가 비었는데 이벤트는 하나도 없었습니다 | 개념 + 직접 쓰기 + 실험 C·4·5·6 | 원고 |
 | 6 | 한 번 고쳤는데 결과가 셋으로 갈렸습니다 | 개념 + 직접 쓰기 + 심볼릭 링크 + subPath 실험 | 원고 |
-| 7 | PV / PVC / StatefulSet | 개념 + 데이터 유지 + 실험 E | 발행·확장 필요 |
+| 7 | PV / PVC / StatefulSet | 개념 + 데이터 유지 (정적 프로비저닝) | 발행 · 후속 12번 |
 | 8 | 잘 떴는데 요청 30번에 전부 죽었습니다 | 개념 + 직접 쓰기 + readiness·liveness·OOM 실험 | 원고 |
 | 9 | 만들긴 했는데 아무도 읽지 않았습니다 | 개념 + 직접 쓰기 + Ingress·LoadBalancer·Local 실험 | 원고 |
 | 10 | redis - 스키마를 만든 적이 없는데 데이터가 들어가 있습니다 | 미들웨어 (독립) | 원고 |
 | 11 | PV 도 PVC 도 Bound 인데 Pod 가 안 떴습니다 | 매니페스트 10개 종합 | 발행 |
+| 12 | PV 를 만들어주는 것도 결국 Pod 하나였습니다 | 동적 프로비저닝. 7번의 후속 | 원고 |
+
+```text
+12번은 5단계 준비 중에 한 작업이다 (Prometheus 가 저장소를 필요로 해서)
+  주제      스토리지 → 4단계
+  작업 기록  03-dynamic-provisioning.md (이 폴더)
+  시간순 맥락 05.local-monitoring/00-preparation.md
+```
 
 ```text
 [순서 원칙]

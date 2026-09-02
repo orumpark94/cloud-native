@@ -88,7 +88,7 @@ spec:
           # ★ API 와 완전히 같아야 한다
           #   두 Deployment 가 같은 이미지를 봐야 버전이 안 어긋난다
           #   → 한쪽만 고치면 API 는 v2, Worker 는 v1 이 된다
-          image: bookstore:20260826-0839
+          image: bookstore:20260902-0713
           imagePullPolicy: IfNotPresent
 
           securityContext:

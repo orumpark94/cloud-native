@@ -1,0 +1,163 @@
+# PodMonitor — 우리 앱 지표를 Prometheus 에 연결한다
+#
+# 앱은 이미 지표를 내고 있었다. 아무도 안 긁고 있었을 뿐이다
+#   app/metrics.py        지표 정의
+#   main.py:212           관리 포트(9000)의 /metrics
+#   → 3단계에서 다 만들어뒀다. 이 파일은 "긁어라" 는 선언 한 장이다
+#
+# ★★ 왜 ServiceMonitor 가 아니라 PodMonitor 인가        (5단계 Phase 3)
+#
+#   ServiceMonitor 는 Service 를 골라 그 Endpoints 를 긁는다
+#   → Endpoints 에는 Service 에 선언된 포트만 적힌다
+#   → api Service 에는 8000 뿐이다. 9000 이 없다        (07-api.yaml 27번 줄)
+#
+#   그런데 9000 을 Service 에 넣을 수 없다
+#   → 9000 에는 /debug/inject/* 가 같이 있다
+#   → 넣는 순간 NodePort 와 Ingress 로 밖에 열린다
+#
+#   PodMonitor 는 Pod 를 직접 고른다. Service 를 거치지 않는다
+#   → Prometheus 가 Pod IP 로 직접 간다 (10.244.x.x:9000)
+#   → Service 에 9000 을 노출하지 않은 채로 긁을 수 있다
+#
+#   worker 는 애초에 Service 가 없다 (트래픽을 안 받는다)
+#   → ServiceMonitor 로는 시작조차 못 한다. PodMonitor 만 가능하다
+#
+#   ★ 4단계의 "포트를 나눈다" 결정이 5단계의 도구 선택을 정했다
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: podmonitor-app
+  namespace: bookstore
+  # PodMonitor 를 앱 옆에 둔다. monitoring 네임스페이스가 아니다
+  #   Prometheus 의 podMonitorNamespaceSelector 가 {} 라 모든 네임스페이스를 본다
+  #     {}     모든 네임스페이스
+  #     (없음) Prometheus 자신의 네임스페이스만
+  #   → 앱과 같이 다닌다. 앱을 지우면 이것도 같이 지워진다
+  #   → 8단계 GitOps 에서 앱 매니페스트와 한 덩어리로 관리된다
+
+  labels:
+    # ★★ 이 라벨 하나가 전부를 좌우한다. 지우면 아무 일도 안 일어난다
+    #
+    #   Prometheus CR 이 이렇게 선언돼 있다
+    #     spec.podMonitorSelector:
+    #       matchLabels: {release: kube-prom-stack}
+    #
+    #   → 이 조건에 안 걸리면 Operator 가 이 오브젝트를 읽지 않는다
+    #   → apply 는 성공한다. 에러도 경고도 없다
+    #   → 그냥 Target 에 안 나타난다              ★ 가장 찾기 어려운 실패다
+    #
+    #   [왜 이런 게 있나]
+    #     한 클러스터에 Prometheus 를 여러 개 띄울 수 있다
+    #     → "이건 내 것" 을 구분해야 한다
+    #     → Helm 릴리스 이름으로 자동 설정된 값이다
+    #
+    #   [확인]
+    #     kubectl get prometheus kube-prom-stack-kube-prome-prometheus -n monitoring \
+    #       -o jsonpath='{.spec.podMonitorSelector}'
+    release: kube-prom-stack
+
+    # 아래 둘은 이 오브젝트 자신의 명찰이다. 아무것도 고르지 않는다
+    #   app.kubernetes.io/* 가 아니라 monitor.kubernetes.io/* 를 쓴 것은
+    #   앱 워크로드와 감시 설정을 조회에서 구분하려는 의도다
+    #   → 대신 `-l app.kubernetes.io/part-of=bookstore` 조회에는 안 걸린다
+    monitor.kubernetes.io/name: podmonitor-app
+    monitor.kubernetes.io/part-of: bookstore
+
+spec:
+  # ★ 여기가 Pod 를 고르는 조건이다
+  #
+  #   무엇을 보는가
+  #     Pod 의 metadata.labels 를 본다
+  #     = Deployment 의 spec.template.metadata.labels 에서 복사된 것
+  #     → Service 의 라벨도, Deployment 자신의 라벨도 안 본다
+  #
+  #   matchLabels 는 부분집합 매칭이다
+  #     여기 적은 라벨을 Pod 가 전부 갖고 있으면 통과
+  #     → Pod 가 라벨을 더 가져도 상관없다
+  #     → 조건을 늘리면 대상이 좁아진다 (AND)
+  #
+  #   ★ pod-template-hash 는 절대 쓰지 않는다
+  #     이미지를 바꿀 때마다 값이 바뀐다 → 배포하는 순간 아무것도 못 찾는다
+  selector:
+    # part-of 로 고른 이유 — api 와 worker 를 한 장으로 묶는다
+    #
+    #   [무엇이 걸리나]
+    #     api        admin(9000) 있음  → target 생성
+    #     worker     admin(9000) 있음  → target 생성
+    #     postgres   admin 없음        → 아무 일 없음
+    #     redis      admin 없음        → 아무 일 없음
+    #
+    #   → 라벨로는 넷 다 걸리지만, admin 이라는 이름의 컨테이너 포트가
+    #     없는 Pod 에서는 target 이 생기지 않는다. 조용히 넘어간다
+    #
+    #   ★ 대가 — 나중에 postgres 에 admin 포트를 추가하면
+    #     이 파일을 손대지 않았는데 갑자기 긁히기 시작한다
+    #     → 편한 만큼 예측이 어려워진다
+    #     → 명시적으로 가려면 name: api / name: worker 로 두 장을 쓴다
+    matchLabels:
+      app.kubernetes.io/part-of: bookstore
+
+  # 어느 네임스페이스에서 Pod 를 찾을지
+  #   생략하면 이 PodMonitor 가 있는 네임스페이스(bookstore)가 기본이다
+  #   → 생략해도 결과는 같다. 명시하는 쪽을 골랐다
+  #   → 나중에 bookstore-staging 을 추가할 때 여기만 보면 된다
+  namespaceSelector:
+    matchNames:
+      - bookstore
+
+  podMetricsEndpoints:
+    # ★ 포트는 번호가 아니라 "컨테이너 포트의 이름" 이다
+    #
+    #   07-api.yaml 의 이 선언을 참조한다
+    #     ports:
+    #       - name: admin
+    #         containerPort: 9000
+    #
+    #   → 번호를 바꿔도 이 파일을 안 고쳐도 된다
+    #   → probe 의 port: admin 과 같은 참조 방식이다     (4단계)
+    #
+    #   ★ containerPort 선언은 문서가 아니라 기능이다
+    #     앱이 실제로 9000 을 열고 있어도
+    #     Pod 스펙에 이름과 함께 선언돼 있지 않으면 발견되지 않는다
+    - port: admin
+
+      # 기본값도 /metrics 지만 명시한다
+      #   앱이 경로를 바꿔도 이 파일만 보면 알 수 있다
+      path: /metrics
+
+      # Prometheus 전역 기본값(30s)과 같게 둔다
+      #   더 촘촘히 하면 시계열 개수가 그만큼 늘고 디스크와 메모리를 더 쓴다
+      #   → 앱 지표를 초 단위로 봐야 할 이유가 아직 없다
+      #   → 필요해지면 여기만 고치면 된다. 앱은 안 건드린다
+      interval: 30s
+
+# ── 적용 후 확인 ─────────────────────────────────────────
+#
+# 1. 오브젝트와 라벨
+#    kubectl get podmonitor -n bookstore --show-labels
+#
+# 2. ★ Operator 가 설정을 다시 만들었는가
+#    kubectl get secret prometheus-kube-prom-stack-kube-prome-prometheus -n monitoring \
+#      -o jsonpath='{.data.prometheus\.yaml\.gz}' | base64 -d | gunzip | grep podMonitor
+#    → job_name: podMonitor/bookstore/podmonitor-app/0
+#    → 우리가 쓴 적 없는 줄이다. Operator 가 생성한 것이다
+#
+# 3. ★ 재시작 없이 반영됐는가                    ← 이번 Phase 의 핵심
+#    kubectl get pod -n monitoring prometheus-kube-prom-stack-kube-prome-prometheus-0
+#    → RESTARTS 와 AGE 가 그대로여야 한다
+#    → config-reloader 사이드카가 POST /-/reload 를 부른다. 프로세스는 안 죽는다
+#
+# 4. Target
+#    curl -s http://<노드IP>:30090/api/v1/targets | grep bookstore
+#
+# 5. 앱 지표가 실제로 들어왔는가
+#    curl -s http://<노드IP>:30090/api/v1/query --data-urlencode 'query=app_info'
+#    → 3단계에서 Downward API 로 넣은 pod/node/version 라벨이 보인다
+#
+# [안 나올 때 의심할 순서]
+#   1) release: kube-prom-stack 라벨이 있는가        ← 1순위
+#   2) selector 가 Pod 의 라벨과 맞는가 (Service/Deployment 라벨이 아니다)
+#   3) port 이름이 containerPort 의 name 과 같은가
+#   4) namespaceSelector 가 맞는가
+#   → 넷 다 에러 없이 조용히 실패한다

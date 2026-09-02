@@ -36,7 +36,28 @@ from __future__ import annotations
 
 import time
 
+# ★ 본문을 만드는 함수와 Content-Type 을 같은 곳에서 가져온다   (5단계 Phase 3)
+#
+#   전에는 이랬다
+#     from prometheus_client import generate_latest                        평문 본문
+#     from prometheus_client.openmetrics.exposition import CONTENT_TYPE_LATEST
+#                                                          OpenMetrics 이름표
+#
+#   → 본문은 평문인데 "나는 OpenMetrics 다" 라고 알려주고 있었다
+#   → OpenMetrics 규격은 본문이 반드시 "# EOF" 로 끝나야 한다
+#     (잘린 응답을 구별하기 위한 종료 표시다. 평문에는 없다)
+#   → Prometheus 가 이름표를 믿고 OpenMetrics 파서를 켰다가 실패했다
+#        scrape 실패:  data does not end with # EOF
+#
+#   사람이 curl 로 볼 때는 안 드러난다. Content-Type 을 안 보니까
+#   → Prometheus 를 처음 붙인 지금에서야 발견됐다
+#
+#   [OpenMetrics 로 가려면 둘 다 openmetrics.exposition 에서 가져온다]
+#     exemplar(트레이스 ID 연결)를 쓸 수 있다
+#     대신 카운터마다 _created 시계열이 하나씩 더 생긴다
+#     → 지금은 그 기능이 필요 없어서 평문으로 통일한다
 from prometheus_client import (
+    CONTENT_TYPE_LATEST,
     CollectorRegistry,
     Counter,
     Gauge,
@@ -44,7 +65,6 @@ from prometheus_client import (
     Info,
     generate_latest,
 )
-from prometheus_client.openmetrics.exposition import CONTENT_TYPE_LATEST
 
 # 기본 레지스트리를 그대로 쓴다.
 # 별도 레지스트리를 만들면 파이썬 런타임 지표(GC, 메모리 등)가 빠진다
