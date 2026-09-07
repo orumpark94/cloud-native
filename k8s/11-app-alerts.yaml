@@ -1,0 +1,98 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: bookstore-alerts
+  namespace: bookstore
+  labels:
+    release: kube-prom-stack
+spec:
+  groups:
+    - name: bookstore
+      interval: 30s
+      rules:
+
+        - alert: BookstoreDependencyDown
+          expr: dependency_up == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $labels.name }} 연결 실패 ({{ $labels.pod }})"
+            description: "1분 이상 의존 서비스에 붙지 못하고 있다."
+
+        - alert: BookstoreDBPoolSaturated
+          expr: db_pool_waiting > 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DB 커넥션 대기 발생 ({{ $labels.pod }})"
+            description: "{{ $value }}개 요청이 대기 중. 기준선은 0."
+
+        # ★ and 로 조건이 두 개다. 뒤쪽이 "표본이 충분한가" 다
+        #
+        #   비율 알람에는 이 조건이 거의 항상 필요하다
+        #     트래픽이 초당 0.1건일 때 1건만 실패해도 에러율이 100% 가 된다
+        #     → 알람이 울린다. 그런데 실제로는 아무 일도 아니다
+        #
+        #   초당 1건 = 5분간 300건 정도다
+        #   → 그 정도는 와야 "5%" 라는 비율이 의미를 갖는다
+        #
+        #   [부작용도 알고 있어야 한다]
+        #     트래픽이 초당 1건 밑으로 떨어지면 이 알람은 침묵한다
+        #     → "요청이 아예 안 온다" 는 별도 알람으로 잡아야 한다
+        #     → 지금은 없다. Phase 6 에서 추가한다
+        #
+        #   [and 와 산술의 차이]
+        #     산술  A / B > 0.05      값을 만들어 비교한다
+        #     and   X and Y           X 중에서 Y 도 참인 것만 남긴다
+        #                             → 결과 값은 왼쪽(에러율)이다
+        #                             → 그래서 $value 가 여전히 비율이다
+        - alert: BookstoreHighErrorRate
+          expr: |
+            (
+              sum(rate(http_requests_total{route_class!="internal", status=~"5.."}[5m]))
+                /
+              sum(rate(http_requests_total{route_class!="internal"}[5m]))
+                > 0.05
+            )
+            and
+            sum(rate(http_requests_total{route_class!="internal"}[5m])) > 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "5xx 에러율이 5%를 넘었다"
+            description: "에러율 {{ $value | humanizePercentage }}. 기준선 0%. (트래픽 초당 1건 이상일 때만 판정)"
+
+        - alert: BookstoreSlowResponse
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le) (
+                rate(http_request_duration_seconds_bucket{route_class!="internal"}[5m])
+              )
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "응답 p95가 50ms를 넘었다"
+            description: "현재 {{ $value }}초. 기준선 0.005초."
+
+        - alert: BookstoreWorkerStalled
+          expr: time() - worker_last_poll_timestamp_seconds{container="worker"} > 120
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Worker가 큐를 안 보고 있다"
+            description: "{{ $labels.pod }} 가 {{ $value }}초째 큐를 확인하지 않았다."
+
+        - alert: BookstoreStockNegative
+          expr: increase(books_stock_negative_total[5m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "재고가 음수가 됐다"
+            description: "최근 5분간 {{ $value }}건. 응답은 200이지만 데이터가 깨졌다."

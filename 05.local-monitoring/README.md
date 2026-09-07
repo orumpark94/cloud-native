@@ -191,7 +191,7 @@ emptyDir 로 두면 Pod 가 죽을 때 데이터가 날아간다
 | 1 | Metrics Server | 매니페스트 | **완료** |
 | 2 | kube-prometheus-stack | Helm | **완료** |
 | 3 | 앱 지표 연결 (PodMonitor) | **직접 작성** | **완료** |
-| 4 | PromQL 과 대시보드 | 직접 | 예정 |
+| 4 | PromQL / 알람 / 대시보드 | **직접 작성** | **완료** |
 | 5 | Loki + Promtail | Helm | 예정 |
 | 6 | Alert Rule + Alertmanager | **직접 작성** | 예정 |
 
@@ -395,7 +395,8 @@ Application stdout/stderr → 수집 에이전트 → Loki → Grafana
 | [01-metrics-server.md](01-metrics-server.md) | Phase 1 — kubectl top, API Aggregation, x509 진단 |
 | [02-prometheus-stack.md](02-prometheus-stack.md) | Phase 2 — Helm 설치, Operator, Target DOWN, kube-proxy 사고와 복구 |
 | [03-app-metrics.md](03-app-metrics.md) | Phase 3 — PodMonitor, Content-Type 불일치, APP_VERSION 어긋남 |
-| (예정) `04-dashboards.md` | Phase 4 |
+| [04-promql-dashboard.md](04-promql-dashboard.md) | Phase 4 — PromQL, 기준선 실측, 히스토그램 버킷 함정, 알람 6개, 대시보드 |
+| (예정) `05-loki.md` | Phase 5 |
 | (예정) `04-promql.md` | Phase 4 |
 | (예정) `05-loki.md` | Phase 5 |
 | (예정) `06-alert.md` | Phase 6 |

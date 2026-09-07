@@ -1,0 +1,400 @@
+# Grafana 대시보드 — Bookstore / Incident
+#
+# ★★ 왜 ConfigMap 인가                                   (5단계 Phase 4)
+#
+#   Grafana UI 에서 만든 대시보드는 /var/lib/grafana/grafana.db 에 들어간다
+#   그 경로에 emptyDir 이 붙어 있다 (values.yaml 에 persistence 를 안 켰다)
+#   → Pod 이 재시작하면 사라진다
+#
+#   ConfigMap 에 두면
+#     원본은 etcd 에 있다 → Pod 이 죽어도 남는다
+#     git 에 남는다 → 누가 언제 왜 바꿨는지 추적된다
+#     클러스터를 다시 세워도 apply 한 번이면 복원된다
+#     → 8단계에서 Argo CD 가 관리한다
+#
+#   ★ 사이드카가 이 라벨을 보고 찾는다
+#       grafana_dashboard: "1"
+#     → PodMonitor 의 release 라벨, PrometheusRule 의 release 라벨과 같은 구조다
+#     → 라벨이 없으면 조용히 무시된다
+#
+#   [동작]
+#     ConfigMap(etcd)
+#       → 사이드카가 watch → Pod 안 /tmp/dashboards 에 파일로 씀
+#       → Grafana 가 그 디렉터리를 읽음
+#     → Pod 안의 파일은 사본이다. 날아가도 다시 만들어진다
+#
+# ★ 대시보드 목적 — 장애 조사용이다. 상시 감시용이 아니다
+#
+#   행 순서가 "증상 → 원인" 이다
+#     사람은 "503 이 났다" 에서 시작해 아래로 내려가며 찾는다
+#     맨 위 요약 행만 예외 — 자원부터 크게 배제하고 들어가려는 것
+#
+#   연쇄 장애가 일어나는 순서는 반대다
+#     Redis 죽음 → 캐시 미스 급증 → DB 로 몰림 → 풀 고갈 → 503
+#   읽는 순서
+#     503(행1) → 풀(행3) → DB(행3) → 미스(행2) → Redis(행2)
+#
+# [데이터소스]
+#   패널에 datasource 를 명시하지 않았다 → Grafana 의 기본 데이터소스를 쓴다
+#   차트가 Prometheus 를 기본으로 설정해두었다
+#   → "No data" 만 뜨면 패널 편집에서 데이터소스를 확인할 것
+#
+# [적용]
+#   kubectl apply -f k8s/12-grafana-dashboard.yaml
+#   → 사이드카가 30초 안에 가져간다. Grafana 재시작 불필요
+#   kubectl logs -n monitoring deploy/kube-prom-stack-grafana -c grafana-sc-dashboard --tail=20
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bookstore-incident-dashboard
+  namespace: monitoring
+  # ★ 사이드카가 monitoring 네임스페이스만 볼 수도 있다
+  #   기본값이 그렇다 (SEARCH_NAMESPACE 미설정 시 자기 네임스페이스)
+  #   → 앱 옆(bookstore)에 두고 싶으면 사이드카 설정을 바꿔야 한다
+  #   → 지금은 관례대로 monitoring 에 둔다
+  labels:
+    grafana_dashboard: "1"           # ★ 이게 없으면 아무 일도 안 일어난다
+    app.kubernetes.io/part-of: bookstore
+data:
+  bookstore-incident.json: |
+    {
+      "uid": "bookstore-incident",
+      "title": "Bookstore / Incident",
+      "description": "장애 조사용. 증상에서 원인으로 내려간다",
+      "tags": ["bookstore", "incident"],
+      "timezone": "browser",
+      "editable": true,
+      "schemaVersion": 39,
+      "refresh": "30s",
+      "time": { "from": "now-1h", "to": "now" },
+      "annotations": { "list": [] },
+      "templating": { "list": [] },
+      "panels": [
+
+        { "type": "row", "title": "요약 — 지금 정상인가", "id": 100, "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "panels": [] },
+
+        { "type": "stat", "title": "Ready Pod", "id": 1,
+          "description": "api2 + worker1 + postgres1 + redis1 = 5 가 정상",
+          "gridPos": { "h": 4, "w": 5, "x": 0, "y": 1 },
+          "targets": [ { "refId": "A",
+            "expr": "sum(kube_pod_status_ready{namespace=\"bookstore\", condition=\"true\"})" } ],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+          "fieldConfig": { "defaults": { "decimals": 0,
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "red", "value": null }, { "color": "green", "value": 5 } ] } },
+            "overrides": [] } },
+
+        { "type": "stat", "title": "재시작 (1h)", "id": 2,
+          "gridPos": { "h": 4, "w": 5, "x": 5, "y": 1 },
+          "targets": [ { "refId": "A",
+            "expr": "sum(increase(kube_pod_container_status_restarts_total{namespace=\"bookstore\"}[1h]))" } ],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+          "fieldConfig": { "defaults": { "decimals": 0,
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } },
+            "overrides": [] } },
+
+        { "type": "stat", "title": "CPU (limits 대비)", "id": 3,
+          "description": "기준선 2.9%",
+          "gridPos": { "h": 4, "w": 5, "x": 10, "y": 1 },
+          "targets": [ { "refId": "A",
+            "expr": "max(rate(container_cpu_usage_seconds_total{namespace=\"bookstore\", container=~\"api|worker\"}[5m]) / on(pod, container) kube_pod_container_resource_limits{namespace=\"bookstore\", resource=\"cpu\"})" } ],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+          "fieldConfig": { "defaults": { "unit": "percentunit", "decimals": 1,
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null }, { "color": "yellow", "value": 0.7 }, { "color": "red", "value": 0.9 } ] } },
+            "overrides": [] } },
+
+        { "type": "stat", "title": "메모리 (limits 대비)", "id": 4,
+          "description": "기준선 18.6%. 4단계에서 48Mi 로 잡았을 때는 99.4% 였다",
+          "gridPos": { "h": 4, "w": 5, "x": 15, "y": 1 },
+          "targets": [ { "refId": "A",
+            "expr": "max(container_memory_working_set_bytes{namespace=\"bookstore\", container=~\"api|worker\"} / on(pod, container) kube_pod_container_resource_limits{namespace=\"bookstore\", resource=\"memory\"})" } ],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+          "fieldConfig": { "defaults": { "unit": "percentunit", "decimals": 1,
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null }, { "color": "yellow", "value": 0.7 }, { "color": "red", "value": 0.9 } ] } },
+            "overrides": [] } },
+
+        { "type": "stat", "title": "알람 (firing)", "id": 5,
+          "description": "or vector(0) — 결과가 비면 No data 가 되므로 0 을 만든다",
+          "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+          "targets": [ { "refId": "A",
+            "expr": "count(ALERTS{alertstate=\"firing\", alertname=~\"Bookstore.*\"}) or vector(0)" } ],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+          "fieldConfig": { "defaults": { "decimals": 0,
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } },
+            "overrides": [] } },
+
+        { "type": "row", "title": "1. 증상 — 사용자가 겪는 것", "id": 101, "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }, "panels": [] },
+
+        { "type": "timeseries", "title": "초당 요청 수 (Pod별)", "id": 10,
+          "description": "route_class=internal 제외. /metrics 와 probe 를 빼야 실제 트래픽이 보인다",
+          "gridPos": { "h": 8, "w": 6, "x": 0, "y": 6 },
+          "targets": [ { "refId": "A", "legendFormat": "{{pod}}",
+            "expr": "sum by (pod) (rate(http_requests_total{namespace=\"bookstore\", route_class!=\"internal\"}[5m]))" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "reqps",
+            "custom": { "fillOpacity": 10, "lineWidth": 1 } }, "overrides": [] } },
+
+        { "type": "timeseries", "title": "상태 코드별", "id": 11,
+          "gridPos": { "h": 8, "w": 6, "x": 6, "y": 6 },
+          "targets": [ { "refId": "A", "legendFormat": "{{status}}",
+            "expr": "sum by (status) (rate(http_requests_total{namespace=\"bookstore\", route_class!=\"internal\"}[5m]))" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "reqps",
+            "custom": { "fillOpacity": 20, "lineWidth": 1, "stacking": { "mode": "normal" } } }, "overrides": [] } },
+
+        { "type": "timeseries", "title": "5xx 에러율", "id": 12,
+          "description": "알람 BookstoreHighErrorRate 임계값 5%. 기준선 0%. ★ 분자에 or vector(0) 을 붙였다 — 500 이 한 번도 없으면 시계열 자체가 없어서 나눗셈 결과가 통째로 비고 No data 가 된다. 알람은 안 울리는 게 맞지만 대시보드는 0 을 보여줘야 한다",
+          "gridPos": { "h": 8, "w": 6, "x": 12, "y": 6 },
+          "targets": [ { "refId": "A", "legendFormat": "5xx",
+            "expr": "(sum(rate(http_requests_total{namespace=\"bookstore\", route_class!=\"internal\", status=~\"5..\"}[5m])) or vector(0)) / sum(rate(http_requests_total{namespace=\"bookstore\", route_class!=\"internal\"}[5m]))" } ],
+          "options": { "legend": { "showLegend": false },
+            "tooltip": { "mode": "single" } },
+          "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0,
+            "custom": { "fillOpacity": 10, "lineWidth": 2, "thresholdsStyle": { "mode": "line" },
+              "axisSoftMax": 0.1 },
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null }, { "color": "red", "value": 0.05 } ] } },
+            "overrides": [] } },
+
+        { "type": "timeseries", "title": "응답시간 p50 / p95 / p99", "id": 13,
+          "description": "기준선 p50 2.5ms, p95 4.8ms, p99.9 20ms. 알람 임계값 50ms",
+          "gridPos": { "h": 8, "w": 6, "x": 18, "y": 6 },
+          "targets": [
+            { "refId": "A", "legendFormat": "p50",
+              "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"bookstore\", route_class!=\"internal\"}[5m])))" },
+            { "refId": "B", "legendFormat": "p95",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"bookstore\", route_class!=\"internal\"}[5m])))" },
+            { "refId": "C", "legendFormat": "p99",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"bookstore\", route_class!=\"internal\"}[5m])))" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "s", "min": 0,
+            "custom": { "fillOpacity": 0, "lineWidth": 2, "thresholdsStyle": { "mode": "line" } },
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null }, { "color": "red", "value": 0.05 } ] } },
+            "overrides": [] } },
+
+        { "type": "row", "title": "2. 의존 서비스 — 앱에서 본 postgres / redis", "id": 102, "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }, "panels": [] },
+
+        { "type": "state-timeline", "title": "의존 서비스 상태", "id": 20,
+          "description": "앱이 실제로 붙어본 결과다. DB 자체 상태가 아니라 '이 앱이 쓸 수 있는가'",
+          "gridPos": { "h": 7, "w": 6, "x": 0, "y": 15 },
+          "targets": [ { "refId": "A", "legendFormat": "{{pod}} / {{name}}",
+            "expr": "dependency_up{namespace=\"bookstore\"}" } ],
+          "options": { "showValue": "auto", "mergeValues": true,
+            "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" } },
+          "fieldConfig": { "defaults": { "min": 0, "max": 1,
+            "color": { "mode": "thresholds" },
+            "mappings": [
+              { "type": "value", "options": { "0": { "text": "DOWN", "color": "red",   "index": 0 } } },
+              { "type": "value", "options": { "1": { "text": "UP",   "color": "green", "index": 1 } } } ],
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } },
+            "overrides": [] } },
+
+        { "type": "timeseries", "title": "캐시 결과 (hit / miss / error)", "id": 21,
+          "description": "★ Redis 가 죽으면 miss 가 먼저 튄다. 연쇄 장애의 첫 신호",
+          "gridPos": { "h": 7, "w": 6, "x": 6, "y": 15 },
+          "targets": [ { "refId": "A", "legendFormat": "{{result}}",
+            "expr": "sum by (result) (rate(cache_operations_total{namespace=\"bookstore\"}[5m]))" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "ops",
+            "custom": { "fillOpacity": 20, "lineWidth": 1, "stacking": { "mode": "normal" } } }, "overrides": [] } },
+
+        { "type": "timeseries", "title": "캐시 적중률", "id": 22,
+          "description": "기준선 98.9%",
+          "gridPos": { "h": 7, "w": 6, "x": 12, "y": 15 },
+          "targets": [ { "refId": "A", "legendFormat": "hit rate",
+            "expr": "sum(rate(cache_operations_total{namespace=\"bookstore\", result=\"hit\"}[5m])) / sum(rate(cache_operations_total{namespace=\"bookstore\"}[5m]))" } ],
+          "options": { "legend": { "showLegend": false }, "tooltip": { "mode": "single" } },
+          "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1,
+            "custom": { "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [] } },
+
+        { "type": "timeseries", "title": "의존 서비스 오류", "id": 23,
+          "description": "kind = timeout / refused / other. 예외 종류를 셋으로 줄여 카디널리티를 막았다",
+          "gridPos": { "h": 7, "w": 6, "x": 18, "y": 15 },
+          "targets": [ { "refId": "A", "legendFormat": "{{name}} / {{kind}}",
+            "expr": "sum by (name, kind) (rate(dependency_errors_total{namespace=\"bookstore\"}[5m]))" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "ops",
+            "custom": { "fillOpacity": 20, "lineWidth": 1 } }, "overrides": [] } },
+
+        { "type": "row", "title": "3. 포화 — 503 보다 먼저 움직인다", "id": 103, "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 }, "panels": [] },
+
+        { "type": "timeseries", "title": "DB 커넥션 풀 (Pod별)", "id": 30,
+          "description": "★ 이 대시보드의 핵심 패널. Redis 죽음 → 캐시 미스 → DB 로 몰림 → available 0, waiting 상승. 503 보다 먼저 보인다. size 는 현재 열린 수이지 최대치가 아니다 (MIN 2 / MAX 10)",
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 23 },
+          "targets": [
+            { "refId": "A", "legendFormat": "{{pod}} size",      "expr": "db_pool_size{namespace=\"bookstore\"}" },
+            { "refId": "B", "legendFormat": "{{pod}} available", "expr": "db_pool_available{namespace=\"bookstore\"}" },
+            { "refId": "C", "legendFormat": "{{pod}} waiting",   "expr": "db_pool_waiting{namespace=\"bookstore\"}" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "min": 0,
+            "custom": { "fillOpacity": 0, "lineWidth": 2 } }, "overrides": [] } },
+
+        { "type": "timeseries", "title": "커넥션 대기 시간 p95", "id": 31,
+          "description": "기준선 0. 여기가 오르면 풀이 마르고 있다는 뜻이다",
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 23 },
+          "targets": [ { "refId": "A", "legendFormat": "{{pod}}",
+            "expr": "histogram_quantile(0.95, sum by (le, pod) (rate(db_pool_wait_seconds_bucket{namespace=\"bookstore\"}[5m])))" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "s", "min": 0,
+            "custom": { "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [] } },
+
+        { "type": "timeseries", "title": "DB 쿼리 시간 p95 (쿼리별)", "id": 32,
+          "description": "offset_bucket 으로 구간을 나눠뒀다. OFFSET 이 커지면 느려지는 것을 잡으려는 것",
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 23 },
+          "targets": [ { "refId": "A", "legendFormat": "{{query}}",
+            "expr": "histogram_quantile(0.95, sum by (le, query) (rate(db_query_duration_seconds_bucket{namespace=\"bookstore\"}[5m])))" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "s", "min": 0,
+            "custom": { "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [] } },
+
+        { "type": "row", "title": "4. 큐 / Worker", "id": 104, "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 }, "panels": [] },
+
+        { "type": "timeseries", "title": "큐 길이", "id": 40,
+          "description": "container=worker 필터가 필요하다. api Pod 도 이 지표를 0 으로 노출한다",
+          "gridPos": { "h": 7, "w": 6, "x": 0, "y": 32 },
+          "targets": [ { "refId": "A", "legendFormat": "{{pod}}",
+            "expr": "queue_length{namespace=\"bookstore\", container=\"worker\"}" } ],
+          "options": { "legend": { "showLegend": false }, "tooltip": { "mode": "single" } },
+          "fieldConfig": { "defaults": { "min": 0,
+            "custom": { "fillOpacity": 20, "lineWidth": 2 } }, "overrides": [] } },
+
+        { "type": "timeseries", "title": "입력 vs 소비 속도", "id": 41,
+          "description": "입력 > 소비 면 큐가 쌓인다. 길이만 봐서는 문제인지 알 수 없다",
+          "gridPos": { "h": 7, "w": 6, "x": 6, "y": 32 },
+          "targets": [
+            { "refId": "A", "legendFormat": "enqueued", "expr": "sum(rate(queue_enqueued_total{namespace=\"bookstore\"}[5m]))" },
+            { "refId": "B", "legendFormat": "dequeued", "expr": "sum(rate(queue_dequeued_total{namespace=\"bookstore\"}[5m]))" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "ops", "min": 0,
+            "custom": { "fillOpacity": 0, "lineWidth": 2 } }, "overrides": [] } },
+
+        { "type": "timeseries", "title": "대기 시간 vs 처리 시간 (p95)", "id": 42,
+          "description": "★ 둘을 나눈 이유. wait 이 길면 Worker 부족(늘리면 해결), process 가 길면 처리가 느린 것(늘려도 소용없다). 대응이 정반대다",
+          "gridPos": { "h": 7, "w": 6, "x": 12, "y": 32 },
+          "targets": [
+            { "refId": "A", "legendFormat": "queue wait p95",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(order_queue_wait_seconds_bucket{namespace=\"bookstore\"}[5m])))" },
+            { "refId": "B", "legendFormat": "process p95",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(order_process_duration_seconds_bucket{namespace=\"bookstore\"}[5m])))" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "s", "min": 0,
+            "custom": { "fillOpacity": 0, "lineWidth": 2 } }, "overrides": [] } },
+
+        { "type": "timeseries", "title": "Worker 마지막 폴링 경과", "id": 43,
+          "description": "기준선 22초. 알람 BookstoreWorkerStalled 임계값 120초. Worker 가 Running 인데 큐를 안 보는 상태를 잡는다",
+          "gridPos": { "h": 7, "w": 6, "x": 18, "y": 32 },
+          "targets": [ { "refId": "A", "legendFormat": "{{pod}}",
+            "expr": "time() - worker_last_poll_timestamp_seconds{namespace=\"bookstore\", container=\"worker\"}" } ],
+          "options": { "legend": { "showLegend": false }, "tooltip": { "mode": "single" } },
+          "fieldConfig": { "defaults": { "unit": "s", "min": 0,
+            "custom": { "fillOpacity": 10, "lineWidth": 2, "thresholdsStyle": { "mode": "line" } },
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null }, { "color": "red", "value": 120 } ] } },
+            "overrides": [] } },
+
+        { "type": "row", "title": "5. 비즈니스 — 기술은 정상인데 데이터가 깨지는 경우", "id": 105, "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 }, "panels": [] },
+
+        { "type": "timeseries", "title": "주문 접수 결과", "id": 50,
+          "description": "accepted / out_of_stock / error",
+          "gridPos": { "h": 7, "w": 8, "x": 0, "y": 40 },
+          "targets": [ { "refId": "A", "legendFormat": "{{result}}",
+            "expr": "sum by (result) (rate(orders_created_total{namespace=\"bookstore\"}[5m]))" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "ops",
+            "custom": { "fillOpacity": 20, "lineWidth": 1, "stacking": { "mode": "normal" } } }, "overrides": [] } },
+
+        { "type": "timeseries", "title": "Worker 처리 결과", "id": 51,
+          "description": "completed / failed / orphaned",
+          "gridPos": { "h": 7, "w": 8, "x": 8, "y": 40 },
+          "targets": [ { "refId": "A", "legendFormat": "{{result}}",
+            "expr": "sum by (result) (rate(orders_processed_total{namespace=\"bookstore\"}[5m]))" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "ops",
+            "custom": { "fillOpacity": 20, "lineWidth": 1, "stacking": { "mode": "normal" } } }, "overrides": [] } },
+
+        { "type": "stat", "title": "재고 음수 (누적)", "id": 52,
+          "description": "★ '성공했지만 잘못된' 것을 세는 지표. 응답 200, Pod Running, probe 통과 — 그런데 데이터가 깨진 상태. 어느 층도 자동으로 안 잡아준다. rate 를 안 쓰고 누적으로 본다",
+          "gridPos": { "h": 7, "w": 8, "x": 16, "y": 40 },
+          "targets": [ { "refId": "A",
+            "expr": "sum(books_stock_negative_total{namespace=\"bookstore\"}) or vector(0)" } ],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area" },
+          "fieldConfig": { "defaults": { "decimals": 0,
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } },
+            "overrides": [] } },
+
+        { "type": "row", "title": "6. 자원 — Pod별 상세", "id": 106, "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 47 }, "panels": [] },
+
+        { "type": "timeseries", "title": "메모리 (Pod별, limits 대비)", "id": 60,
+          "description": "빨간 선 0.994 는 4단계에서 limits 를 48Mi 로 잡았을 때의 사용률이다. 여유가 0.6% 였다",
+          "gridPos": { "h": 7, "w": 6, "x": 0, "y": 48 },
+          "targets": [ { "refId": "A", "legendFormat": "{{pod}}",
+            "expr": "container_memory_working_set_bytes{namespace=\"bookstore\", container=~\"api|worker\"} / on(pod, container) kube_pod_container_resource_limits{namespace=\"bookstore\", resource=\"memory\"}" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1,
+            "custom": { "fillOpacity": 10, "lineWidth": 2, "thresholdsStyle": { "mode": "line" } },
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null }, { "color": "red", "value": 0.994 } ] } },
+            "overrides": [] } },
+
+        { "type": "timeseries", "title": "CPU (Pod별, limits 대비)", "id": 61,
+          "gridPos": { "h": 7, "w": 6, "x": 6, "y": 48 },
+          "targets": [ { "refId": "A", "legendFormat": "{{pod}}",
+            "expr": "rate(container_cpu_usage_seconds_total{namespace=\"bookstore\", container=~\"api|worker\"}[5m]) / on(pod, container) kube_pod_container_resource_limits{namespace=\"bookstore\", resource=\"cpu\"}" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0,
+            "custom": { "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [] } },
+
+        { "type": "timeseries", "title": "CPU throttle 비율", "id": 62,
+          "description": "CPU limits 는 메모리와 다르다. 초과해도 안 죽고 100ms 주기마다 강제로 재운다. Pod 는 Running 이고 probe 도 통과하는데 응답만 느려진다. 이 지표 없이는 원인을 못 찾는다. 5% 를 넘으면 limits 상향을 검토한다",
+          "gridPos": { "h": 7, "w": 6, "x": 12, "y": 48 },
+          "targets": [ { "refId": "A", "legendFormat": "{{pod}}",
+            "expr": "rate(container_cpu_cfs_throttled_periods_total{namespace=\"bookstore\"}[5m]) / rate(container_cpu_cfs_periods_total{namespace=\"bookstore\"}[5m])" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0,
+            "custom": { "fillOpacity": 10, "lineWidth": 2, "thresholdsStyle": { "mode": "line" } },
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null }, { "color": "red", "value": 0.05 } ] } },
+            "overrides": [] } },
+
+        { "type": "timeseries", "title": "재시작 횟수 (누적)", "id": 63,
+          "description": "OOM 이면 kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"} 가 1 이 된다",
+          "gridPos": { "h": 7, "w": 6, "x": 18, "y": 48 },
+          "targets": [ { "refId": "A", "legendFormat": "{{pod}} / {{container}}",
+            "expr": "kube_pod_container_status_restarts_total{namespace=\"bookstore\"}" } ],
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" } },
+          "fieldConfig": { "defaults": { "decimals": 0, "min": 0,
+            "custom": { "fillOpacity": 0, "lineWidth": 2 } }, "overrides": [] } }
+
+      ]
+    }
